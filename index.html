@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hatch PPE — Pricing Test Tool</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root {
+    --bg: #0f172a; --bg2: #1e293b; --bg3: #334155;
+    --text: #e2e8f0; --text2: #94a3b8; --text3: #64748b;
+    --accent: #38bdf8; --accent2: #0ea5e9;
+    --green: #22c55e; --red: #ef4444; --yellow: #eab308; --orange: #f97316;
+    --border: #475569;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+
+  .app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* Header */
+  .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
+  .header .meta { font-size: 12px; color: var(--text3); }
+
+  /* Connection bar */
+  .conn-bar { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 8px 24px; display: flex; gap: 12px; align-items: center; }
+  .conn-bar label { font-size: 12px; color: var(--text2); white-space: nowrap; }
+  .conn-bar input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; color: var(--text); font-size: 12px; font-family: monospace; }
+  .conn-bar input:focus { outline: none; border-color: var(--accent); }
+  .conn-status { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+  .conn-status.ok { background: rgba(34,197,94,0.2); color: var(--green); }
+  .conn-status.err { background: rgba(239,68,68,0.2); color: var(--red); }
+
+  /* Main layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Left panel - form */
+  .panel-left { width: 340px; min-width: 340px; border-right: 1px solid var(--border); overflow-y: auto; padding: 16px; background: var(--bg2); }
+  .form-section { margin-bottom: 16px; }
+  .form-section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent); margin-bottom: 8px; font-weight: 600; }
+  .form-row { display: flex; gap: 8px; margin-bottom: 6px; }
+  .form-group { flex: 1; }
+  .form-group label { display: block; font-size: 11px; color: var(--text2); margin-bottom: 2px; }
+  .form-group input, .form-group select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; color: var(--text); font-size: 13px; }
+  .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--accent); }
+  .form-group select { cursor: pointer; }
+
+  .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.15s; }
+  .btn-primary { background: var(--accent2); color: white; width: 100%; margin-top: 8px; }
+  .btn-primary:hover { background: var(--accent); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Right panel - results */
+  .panel-right { flex: 1; overflow-y: auto; padding: 16px 24px; }
+
+  /* Execution bar */
+  .exec-bar { background: var(--bg2); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: flex; gap: 24px; flex-wrap: wrap; }
+  .exec-stat { font-size: 12px; }
+  .exec-stat .label { color: var(--text3); }
+  .exec-stat .value { color: var(--text); font-weight: 600; }
+
+  /* Product group */
+  .product-group { background: var(--bg2); border-radius: 8px; margin-bottom: 12px; overflow: hidden; border: 1px solid var(--bg3); }
+  .product-header { padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+  .product-header:hover { background: var(--bg3); }
+  .product-title { font-size: 14px; font-weight: 600; }
+  .product-category { font-size: 11px; color: var(--text3); background: var(--bg); padding: 2px 8px; border-radius: 4px; text-transform: uppercase; }
+  .product-badges { display: flex; gap: 8px; align-items: center; }
+
+  /* LLPA summary */
+  .llpa-summary { padding: 0 16px 8px; font-size: 12px; color: var(--text2); border-bottom: 1px solid var(--bg3); }
+  .llpa-detail { display: flex; justify-content: space-between; padding: 1px 0; }
+  .llpa-value { font-family: monospace; }
+  .llpa-value.neg { color: var(--red); }
+  .llpa-value.pos { color: var(--green); }
+  .llpa-total { font-weight: 600; border-top: 1px solid var(--bg3); margin-top: 2px; padding-top: 2px; }
+
+  /* Rate table */
+  .rate-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .rate-table th { text-align: left; padding: 6px 10px; color: var(--text3); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--bg3); }
+  .rate-table td { padding: 5px 10px; font-family: monospace; font-size: 12px; border-bottom: 1px solid rgba(51,65,85,0.5); }
+  .rate-table tr:hover td { background: rgba(56,189,248,0.05); }
+  .rate-table tr.par-row td { background: rgba(34,197,94,0.08); }
+  .rate-table tr.par-row:hover td { background: rgba(34,197,94,0.12); }
+
+  .par-badge { font-size: 10px; background: rgba(34,197,94,0.2); color: var(--green); padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+  .discount-badge { font-size: 10px; background: rgba(239,68,68,0.15); color: var(--red); padding: 1px 6px; border-radius: 3px; }
+  .credit-badge { font-size: 10px; background: rgba(34,197,94,0.15); color: var(--green); padding: 1px 6px; border-radius: 3px; }
+
+  /* Ineligible */
+  .ineligible-group { background: var(--bg2); border-radius: 8px; margin-bottom: 8px; padding: 10px 16px; border: 1px solid rgba(239,68,68,0.3); }
+  .ineligible-title { font-size: 13px; color: var(--red); font-weight: 600; }
+  .knockout-reason { font-size: 12px; color: var(--text3); margin-left: 16px; }
+
+  /* Warnings */
+  .warnings { background: rgba(234,179,8,0.1); border: 1px solid rgba(234,179,8,0.3); border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; }
+  .warnings h4 { font-size: 12px; color: var(--yellow); margin-bottom: 4px; }
+  .warnings li { font-size: 12px; color: var(--text2); margin-left: 16px; }
+
+  /* Empty state */
+  .empty-state { text-align: center; padding: 60px 24px; color: var(--text3); }
+  .empty-state h2 { font-size: 20px; margin-bottom: 8px; color: var(--text2); }
+  .empty-state p { font-size: 14px; }
+
+  /* Loading */
+  .loading { text-align: center; padding: 40px; color: var(--accent); }
+  .spinner { display: inline-block; width: 24px; height: 24px; border: 3px solid var(--bg3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Par rate highlight row */
+  .par-highlight { display: inline-flex; align-items: center; gap: 6px; background: rgba(34,197,94,0.1); padding: 4px 12px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; }
+  .par-highlight .rate { font-weight: 700; color: var(--green); font-size: 15px; }
+  .par-highlight .detail { color: var(--text2); font-size: 12px; }
+
+  /* Comp display */
+  .comp-display { font-size: 12px; color: var(--text3); padding: 4px 16px 6px; }
+
+  /* Show more toggle */
+  .show-more { text-align: center; padding: 6px; }
+  .show-more button { background: none; border: 1px solid var(--border); color: var(--text2); padding: 3px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .show-more button:hover { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useRef, useEffect, Component } = React;
+
+// Error boundary to catch render errors and display them instead of blank screen
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error("React Error:", error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return React.createElement('div', {style:{padding:40,color:'#ef4444',background:'#1e293b',fontFamily:'monospace'}},
+        React.createElement('h2', null, 'PPE UI Error'),
+        React.createElement('pre', {style:{whiteSpace:'pre-wrap',marginTop:16}}, String(this.state.error)),
+        React.createElement('button', {onClick:() => this.setState({hasError:false,error:null}), style:{marginTop:16,padding:'8px 16px',background:'#334155',color:'#e2e8f0',border:'none',borderRadius:4,cursor:'pointer'}}, 'Retry')
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// =============================================
+// PPE ENGINE — ported from TypeScript
+// =============================================
+
+// --- Validation ---
+const VALID_PURPOSES = ["purchase","rate_term_refi","cash_out_refi","heloc","heloan"];
+const VALID_PROPERTY_TYPES = ["single_family","condo","townhome","multi_unit_2","multi_unit_3","multi_unit_4","manufactured_home","pud"];
+const VALID_OCCUPANCY = ["primary_residence","secondary_residence","investment_property"];
+
+function validateAndResolve(scenario) {
+  const errors = [];
+  if (!scenario.loan_amount || scenario.loan_amount <= 0) errors.push("Loan amount required");
+  if (!scenario.property_value || scenario.property_value <= 0) errors.push("Property value required");
+  if (!scenario.fico_score || scenario.fico_score < 300 || scenario.fico_score > 850) errors.push("FICO must be 300-850");
+  if (!VALID_PURPOSES.includes(scenario.purpose)) errors.push("Invalid purpose");
+  if (!VALID_PROPERTY_TYPES.includes(scenario.property_type)) errors.push("Invalid property type");
+  if (!VALID_OCCUPANCY.includes(scenario.occupancy)) errors.push("Invalid occupancy");
+  if (!scenario.state_code || !/^[A-Z]{2}$/.test(scenario.state_code)) errors.push("State must be 2-letter code");
+  if (errors.length) return { errors };
+
+  return {
+    errors: [],
+    resolved: {
+      ...scenario,
+      ltv_ratio: (scenario.loan_amount / scenario.property_value) * 100,
+      lock_days: scenario.preferred_lock_days || 30,
+      term_months: scenario.preferred_term_months || 360,
+      amortization: "fixed",
+    }
+  };
+}
+
+// --- Eligibility ---
+function checkEligibility(scenario, ip, productCategory) {
+  const reasons = [];
+  // VA products require veteran status
+  if (productCategory === "va" && !scenario.is_veteran)
+    reasons.push("VA products require veteran status");
+  if (ip.min_fico != null && scenario.fico_score < ip.min_fico)
+    reasons.push(`FICO ${scenario.fico_score} below minimum ${ip.min_fico}`);
+  if (ip.max_ltv_ratio != null && scenario.ltv_ratio > ip.max_ltv_ratio)
+    reasons.push(`LTV ${scenario.ltv_ratio.toFixed(2)}% exceeds max ${ip.max_ltv_ratio}%`);
+  if (ip.max_dti_ratio != null && scenario.dti_ratio != null && scenario.dti_ratio > ip.max_dti_ratio)
+    reasons.push(`DTI ${scenario.dti_ratio.toFixed(1)}% exceeds max ${ip.max_dti_ratio}%`);
+  if (ip.state_exclusions?.length > 0 && ip.state_exclusions.includes(scenario.state_code))
+    reasons.push(`State ${scenario.state_code} excluded`);
+  if (ip.state_availability?.length > 0 && !ip.state_availability.includes(scenario.state_code))
+    reasons.push(`Not available in ${scenario.state_code}`);
+  if (!ip.is_available) reasons.push("Product not available");
+  return { is_eligible: reasons.length === 0, knockout_reasons: reasons };
+}
+
+// --- LLPA Engine ---
+const PURPOSE_KEYWORDS = {
+  purchase: ["Purchase Money", "Purchase"],
+  rate_term_refi: ["Limited Cash-Out"],
+  cash_out_refi: ["Cash-Out Refi", "Cash-Out"],
+  heloc: [], heloan: [],
+};
+const ALL_PURPOSE_KW = ["Purchase Money","Purchase","Limited Cash-Out","Cash-Out Refi","Cash-Out"];
+
+function matrixAppliesToPurpose(name, purpose) {
+  const isPurposeSpecific = ALL_PURPOSE_KW.some(kw => name.includes(kw));
+  if (!isPurposeSpecific) return true;
+  const kws = PURPOSE_KEYWORDS[purpose] || [];
+  if (kws.length === 0) return false;
+  return kws.some(kw => name.includes(kw));
+}
+
+function extractFeature(name) { return name.split(" - ")[0].trim(); }
+
+function featureApplies(feature, s) {
+  if (feature === "ARM") return s.amortization === "arm";
+  if (feature === "Condo") return s.property_type === "condo";
+  if (feature === "Investment Property") return s.occupancy === "investment_property";
+  if (feature === "Second Home") return s.occupancy === "secondary_residence";
+  if (feature === "Manufactured Home") return s.property_type === "manufactured_home";
+  if (feature === "Two- to four-unit property" || feature === "Multi Unit") return (s.num_units || 1) >= 2;
+  if (feature === "DTI Ratio > 40%") return (s.dti_ratio || 0) > 40;
+  if (feature === "DTI > 50") return (s.dti_ratio || 0) > 50;
+  if (feature === "Interest Only") return s.amortization === "interest_only";
+  if (feature === "Purchase") return s.purpose === "purchase";
+  if (feature === "Florida Condo") return s.state_code === "FL" && s.property_type === "condo";
+  if (feature === "Florida") return s.state_code === "FL";
+  if (feature === "State Adjustments" || feature === "State") return true;
+  if (feature.includes(",")) {
+    const states = feature.split(",").map(st => st.trim().toUpperCase());
+    return states.includes(s.state_code.toUpperCase());
+  }
+  if (feature === "High-balance fixed - rate" || feature === "High-balance ARM" ||
+      feature === "Subordinate financing" || feature === "Escrow Waiver" ||
+      feature === "Non - Warrantable Condo" || feature === "Prepay Penalty") return false;
+  return false;
+}
+
+function valueInRange(val, min, max) {
+  if (min !== null && min !== undefined && val < min) return false;
+  if (max !== null && max !== undefined && val > max) return false;
+  return true;
+}
+
+function lookup2D(entries, matrixId, fico, ltv) {
+  for (const e of entries) {
+    if (e.matrix_id !== matrixId) continue;
+    if (valueInRange(fico, e.dimension_1_min, e.dimension_1_max) &&
+        valueInRange(ltv, e.dimension_2_min, e.dimension_2_max)) return e;
+  }
+  return null;
+}
+
+function lookup1D(entries, matrixId, dimType, val) {
+  for (const e of entries) {
+    if (e.matrix_id !== matrixId) continue;
+    if (e.dimension_1_exact_values?.length > 0) {
+      const vs = String(val).toUpperCase();
+      if (e.dimension_1_exact_values.some(v => v.toUpperCase() === vs)) return e;
+    } else if (typeof val === "number") {
+      if (valueInRange(val, e.dimension_1_min, e.dimension_1_max)) return e;
+    }
+  }
+  return null;
+}
+
+function getDim1Value(dimType, s) {
+  switch (dimType) {
+    case "fico": return { value: s.fico_score, label: `FICO ${s.fico_score}` };
+    case "ltv": return { value: s.ltv_ratio, label: `LTV ${s.ltv_ratio.toFixed(2)}%` };
+    case "state": return { value: s.state_code, label: `State ${s.state_code}` };
+    case "property_type": return { value: s.property_type, label: `Property ${s.property_type}` };
+    case "dti": return { value: s.dti_ratio || 0, label: `DTI ${(s.dti_ratio||0).toFixed(1)}%` };
+    case "loan_amount": return { value: s.loan_amount, label: `Loan $${s.loan_amount.toLocaleString()}` };
+    case "occupancy": return { value: s.occupancy, label: `Occupancy ${s.occupancy}` };
+    default: return null;
+  }
+}
+
+function applyLLPAs(matrices, entries, scenario, productCategory) {
+  const details = [];
+  let seq = 0;
+  const applicable = matrices.filter(m => {
+    if (!m.applies_to_product_categories?.includes(productCategory)) return false;
+    return matrixAppliesToPurpose(m.name, scenario.purpose);
+  });
+
+  // FNMA AMI ≤80% LLPA Waiver: primary FICO/LTV matrix waived for
+  // conventional, purchase or rate/term refi, primary residence
+  const amiWaiverActive =
+    scenario.is_ami_below_80 === true &&
+    productCategory === "conventional" &&
+    (scenario.purpose === "purchase" || scenario.purpose === "rate_term_refi") &&
+    scenario.occupancy === "primary_residence";
+
+  for (const m of applicable) {
+    let matched = null, dimLabel = "";
+    if (m.matrix_type === "primary_2d") {
+      if (amiWaiverActive) {
+        details.push({
+          matrix_name: m.name,
+          dimension_label: `AMI ≤80% WAIVER (FICO ${scenario.fico_score} × LTV ${scenario.ltv_ratio.toFixed(2)}%)`,
+          adjustment_points: 0, sequence: seq++,
+        });
+        continue;
+      }
+      matched = lookup2D(entries, m.id, scenario.fico_score, scenario.ltv_ratio);
+      dimLabel = `FICO ${scenario.fico_score} × LTV ${scenario.ltv_ratio.toFixed(2)}%`;
+    } else if (m.matrix_type === "secondary_1d") {
+      const feat = extractFeature(m.name);
+      if (!featureApplies(feat, scenario)) continue;
+      const dv = getDim1Value(m.dimension_1_type, scenario);
+      if (!dv) continue;
+      matched = lookup1D(entries, m.id, m.dimension_1_type, dv.value);
+      dimLabel = dv.label;
+    }
+    if (matched) {
+      details.push({
+        matrix_name: m.name, dimension_label: dimLabel,
+        adjustment_points: matched.adjustment_price_points || 0, sequence: seq++,
+      });
+    }
+  }
+  return { details, total_points: details.reduce((s, d) => s + d.adjustment_points, 0) };
+}
+
+// --- Government Insurance (FHA MIP / VA Funding Fee) ---
+const FHA_CONFORMING_LIMIT = 524225;
+const FHA_UFMIP_RATE = 0.0175;
+
+function getFHAAnnualMIPRate(termMonths, ltvRatio, baseLoanAmount) {
+  const isShortTerm = termMonths <= 180;
+  const isHighBalance = baseLoanAmount > FHA_CONFORMING_LIMIT;
+  if (isShortTerm) {
+    return isHighBalance ? (ltvRatio <= 78 ? 0.15 : 0.65) : (ltvRatio <= 78 ? 0.15 : 0.40);
+  } else {
+    return isHighBalance ? (ltvRatio <= 90 ? 0.70 : 0.75) : (ltvRatio <= 90 ? 0.50 : 0.55);
+  }
+}
+
+function calculateFHAMIP(baseLoanAmount, ltvRatio, termMonths) {
+  const upfront_fee_percent = FHA_UFMIP_RATE * 100;
+  const upfront_fee_amount = Math.round(baseLoanAmount * FHA_UFMIP_RATE * 100) / 100;
+  const annual_rate_percent = getFHAAnnualMIPRate(termMonths, ltvRatio, baseLoanAmount);
+  const totalLoanAmount = baseLoanAmount + upfront_fee_amount;
+  const monthly_amount = Math.round((totalLoanAmount * (annual_rate_percent / 100)) / 12 * 100) / 100;
+  const duration_months = ltvRatio <= 90 ? 132 : null;
+  const duration_label = ltvRatio <= 90 ? "11 years" : "Life of loan";
+  return {
+    type: "fha_mip", upfront_fee_percent, upfront_fee_amount, upfront_financed: true,
+    annual_rate_percent, monthly_amount, duration_months, duration_label,
+  };
+}
+
+function calculateVAFundingFee(baseLoanAmount, propertyValue, purpose, isFirstUse, isExempt) {
+  if (isExempt) {
+    return {
+      type: "va_funding_fee", upfront_fee_percent: 0, upfront_fee_amount: 0,
+      upfront_financed: false, annual_rate_percent: 0, monthly_amount: 0,
+      duration_months: 0, duration_label: "N/A (exempt)",
+    };
+  }
+  const downPct = ((propertyValue - baseLoanAmount) / propertyValue) * 100;
+  let feePct;
+  if (purpose === "rate_term_refi") { feePct = 0.50; }
+  else if (purpose === "cash_out_refi") { feePct = isFirstUse ? 2.15 : 3.30; }
+  else {
+    if (downPct >= 10) feePct = 1.25;
+    else if (downPct >= 5) feePct = 1.50;
+    else feePct = isFirstUse ? 2.15 : 3.30;
+  }
+  const upfront_fee_amount = Math.round(baseLoanAmount * (feePct / 100) * 100) / 100;
+  return {
+    type: "va_funding_fee", upfront_fee_percent: feePct, upfront_fee_amount,
+    upfront_financed: true, annual_rate_percent: 0, monthly_amount: 0,
+    duration_months: 0, duration_label: "N/A",
+  };
+}
+
+// --- Conventional PMI (Private Mortgage Insurance) ---
+// Placeholder BPMI rate matrix: FICO × LTV bands (annual % of loan amount)
+// Based on industry-standard rate cards. TODO: Replace with MI provider API.
+const PMI_RATE_MATRIX = [
+  { minFico: 760, maxFico: 850, rates: { "85": 0.19, "90": 0.30, "95": 0.41, "97": 0.51 } },
+  { minFico: 740, maxFico: 759, rates: { "85": 0.21, "90": 0.34, "95": 0.46, "97": 0.58 } },
+  { minFico: 720, maxFico: 739, rates: { "85": 0.26, "90": 0.41, "95": 0.56, "97": 0.71 } },
+  { minFico: 700, maxFico: 719, rates: { "85": 0.33, "90": 0.52, "95": 0.70, "97": 0.90 } },
+  { minFico: 680, maxFico: 699, rates: { "85": 0.41, "90": 0.65, "95": 0.88, "97": 1.13 } },
+  { minFico: 660, maxFico: 679, rates: { "85": 0.52, "90": 0.82, "95": 1.10, "97": 1.40 } },
+  { minFico: 640, maxFico: 659, rates: { "85": 0.65, "90": 1.01, "95": 1.36, "97": 1.73 } },
+  { minFico: 620, maxFico: 639, rates: { "85": 0.79, "90": 1.24, "95": 1.65, "97": 2.10 } },
+];
+
+function getPMIAnnualRate(ficoScore, ltvRatio) {
+  if (ltvRatio <= 80) return 0;
+  let ltvKey;
+  if (ltvRatio <= 85) ltvKey = "85";
+  else if (ltvRatio <= 90) ltvKey = "90";
+  else if (ltvRatio <= 95) ltvKey = "95";
+  else ltvKey = "97";
+  for (const band of PMI_RATE_MATRIX) {
+    if (ficoScore >= band.minFico && ficoScore <= band.maxFico) return band.rates[ltvKey] || 0;
+  }
+  if (ficoScore < 620) return PMI_RATE_MATRIX[PMI_RATE_MATRIX.length - 1].rates[ltvKey] || 0;
+  return 0;
+}
+
+function estimatePMIDuration(loanAmount, propertyValue, noteRate, termMonths) {
+  const targetBalance = propertyValue * 0.78;
+  const mr = noteRate / 100 / 12;
+  if (mr <= 0 || loanAmount <= targetBalance) return { months: 0, label: "Not required" };
+  const pmt = loanAmount * (mr * Math.pow(1 + mr, termMonths)) / (Math.pow(1 + mr, termMonths) - 1);
+  let bal = loanAmount, months = 0;
+  while (bal > targetBalance && months < termMonths) {
+    bal = bal - (pmt - bal * mr);
+    months++;
+  }
+  const yrs = Math.floor(months / 12), rem = months % 12;
+  const label = yrs > 0 ? (rem > 0 ? `~${yrs}yr ${rem}mo` : `~${yrs} years`) : `~${months} months`;
+  return { months, label };
+}
+
+function calculateConventionalPMI(baseLoanAmount, propertyValue, ltvRatio, ficoScore, termMonths, noteRate) {
+  if (ltvRatio <= 80) {
+    return { type: "none", upfront_fee_percent: 0, upfront_fee_amount: 0, upfront_financed: false, annual_rate_percent: 0, monthly_amount: 0, duration_months: 0, duration_label: "N/A" };
+  }
+  const annual_rate_percent = getPMIAnnualRate(ficoScore, ltvRatio);
+  const monthly_amount = Math.round((baseLoanAmount * (annual_rate_percent / 100)) / 12 * 100) / 100;
+  const dur = estimatePMIDuration(baseLoanAmount, propertyValue, noteRate, termMonths);
+  return {
+    type: "conventional_pmi", upfront_fee_percent: 0, upfront_fee_amount: 0, upfront_financed: false,
+    annual_rate_percent, monthly_amount, duration_months: dur.months, duration_label: dur.label,
+  };
+}
+
+function calcGovInsurance(productCategory, baseLoanAmount, propertyValue, ltvRatio, termMonths, purpose, isFirstVAUse, isVAExempt, ficoScore, noteRate) {
+  if (productCategory === "fha") return calculateFHAMIP(baseLoanAmount, ltvRatio, termMonths);
+  if (productCategory === "va") return calculateVAFundingFee(baseLoanAmount, propertyValue, purpose, isFirstVAUse, isVAExempt);
+  if (productCategory === "conventional" && ltvRatio > 80) return calculateConventionalPMI(baseLoanAmount, propertyValue, ltvRatio, ficoScore || 740, termMonths, noteRate || 7.0);
+  return { type: "none", upfront_fee_percent: 0, upfront_fee_amount: 0, upfront_financed: false, annual_rate_percent: 0, monthly_amount: 0, duration_months: 0, duration_label: "N/A" };
+}
+
+// --- Loan Summary Calculator ---
+// Computes the full borrower-facing cost breakdown for a single rate option.
+// Maps to the format: Interest Rate → Lender Costs → Other Closing Costs → Down Payment → Cash to Close → Loan Amount → Monthly Payments
+function calcLoanSummary(rateOption, scenario, opts) {
+  const p = rateOption.pricing;
+  const gi = p.government_insurance || { type: "none", upfront_fee_amount: 0, upfront_financed: false, monthly_amount: 0 };
+  const feesIn = opts.fees_in || false;
+  const origFee = opts.origination_fee || 0;
+  const escrowAnnualRate = opts.escrow_annual_rate || 1.25;
+
+  // --- Fees-in adjustment ---
+  // When fees-in: origination fee is converted to points and subtracted from price
+  // This effectively shifts the par rate up (rates look higher, but no separate fee line item)
+  const origFeePoints = scenario.loan_amount > 0 ? (origFee / scenario.loan_amount) * 100 : 0;
+  const adjustedFinalPrice = feesIn ? p.final_price_points - origFeePoints : p.final_price_points;
+
+  // --- Cost of Interest Rate (discount points in dollars) ---
+  // Below 100 = borrower pays points (cost), Above 100 = borrower gets credit
+  const costOfRate = ((100 - adjustedFinalPrice) / 100) * scenario.loan_amount;
+
+  // --- Cost of Mortgage Insurance (upfront, even if financed) ---
+  const costOfMI = gi.upfront_fee_amount || 0;
+
+  // --- Other Lender Costs (proc + UW) ---
+  // Fees-out: shown as line item. Fees-in: $0 (already baked into price).
+  const otherLenderCosts = feesIn ? 0 : origFee;
+
+  // --- Total Lender Costs (or Credits) ---
+  const totalLenderCosts = costOfRate + costOfMI + otherLenderCosts;
+
+  // --- Other Closing Costs (unavoidable) --- placeholder 1.5%
+  const otherClosingCosts = Math.round(scenario.loan_amount * 0.015);
+
+  // --- Down Payment (purchase only) ---
+  const downPayment = scenario.purpose === "purchase"
+    ? Math.max(0, scenario.property_value - scenario.loan_amount)
+    : 0;
+
+  // --- Cash Required to Close ---
+  // Total Lender Costs already includes credits as negative costOfRate
+  const cashToClose = totalLenderCosts + otherClosingCosts + downPayment;
+
+  // --- Loan Amount (debt) = total loan including financed MI ---
+  const loanDebt = p.total_loan_amount || scenario.loan_amount;
+
+  // --- Monthly Payment Breakdown ---
+  const monthlyPI = p.monthly_pi;
+  const monthlyMI = gi.monthly_amount || 0;
+  const monthlyEscrow = Math.round((scenario.property_value * (escrowAnnualRate / 100)) / 12);
+  const totalMonthly = monthlyPI + monthlyMI + monthlyEscrow;
+
+  return {
+    interest_rate: p.base_rate_percent,
+    // Lender costs
+    cost_of_rate: Math.round(costOfRate),
+    cost_of_mi: Math.round(costOfMI * 100) / 100,
+    other_lender_costs: Math.round(otherLenderCosts),
+    total_lender_costs: Math.round(totalLenderCosts),
+    // Closing costs
+    other_closing_costs: otherClosingCosts,
+    // Down payment & cash to close
+    down_payment: downPayment,
+    cash_to_close: Math.round(cashToClose),
+    // Loan amount
+    loan_debt: Math.round(loanDebt * 100) / 100,
+    // Monthly payments
+    monthly_pi: monthlyPI,
+    monthly_mi: monthlyMI,
+    monthly_escrow: monthlyEscrow,
+    total_monthly: Math.round(totalMonthly * 100) / 100,
+    // Meta
+    fees_in: feesIn,
+    adjusted_final_price: Math.round(adjustedFinalPrice * 10000) / 10000,
+    gi_type: gi.type,
+    gi_duration: gi.duration_label || "N/A",
+  };
+}
+
+// --- Pricing math ---
+function calculateComp(loanAmount, config) {
+  if (!config.comp_percent) return { comp_dollars: 0, comp_points: 0 };
+  let dollars = loanAmount * config.comp_percent;
+  if (config.comp_floor_percent != null) dollars = Math.max(config.comp_floor_percent, dollars);
+  if (config.comp_ceiling_percent != null) dollars = Math.min(config.comp_ceiling_percent, dollars);
+  return { comp_dollars: dollars, comp_points: (dollars / loanAmount) * 100 };
+}
+
+function monthlyPI(amount, rate, months) {
+  if (months <= 0 || amount <= 0) return 0;
+  const r = rate / 100 / 12;
+  if (r === 0) return Math.round((amount / months) * 100) / 100;
+  const num = r * Math.pow(1 + r, months);
+  const den = Math.pow(1 + r, months) - 1;
+  return Math.round(amount * (num / den) * 100) / 100;
+}
+
+function calcAPR(loanAmount, ratePercent, pricePoints, termMonths) {
+  if (termMonths <= 0 || loanAmount <= 0) return ratePercent;
+  const pointsCost = ((100 - pricePoints) / 100) * loanAmount;
+  const netPrincipal = loanAmount - pointsCost;
+  if (netPrincipal <= 0) return ratePercent;
+
+  const payment = monthlyPI(loanAmount, ratePercent, termMonths);
+  let apr = ratePercent;
+
+  for (let i = 0; i < 100; i++) {
+    const mr = apr / 100 / 12;
+    if (mr <= 0) { apr = 0.001; continue; }
+    const factor = (Math.pow(1+mr, termMonths)-1) / (mr * Math.pow(1+mr, termMonths));
+    const pv = payment * factor;
+    const err = pv - netPrincipal;
+    if (Math.abs(err) < 0.0001) break;
+
+    const bump = 0.00001;
+    const br = mr + bump;
+    const bf = (Math.pow(1+br, termMonths)-1) / (br * Math.pow(1+br, termMonths));
+    const bpv = payment * bf;
+    const dpv = (bpv - pv) / bump / 1200;
+
+    if (Math.abs(dpv) > 0.001) apr -= err / dpv;
+    else apr += err > 0 ? 0.001 : -0.001;
+    apr = Math.max(0.001, Math.min(30, apr));
+  }
+  return Math.round(apr * 10000) / 10000;
+}
+
+// --- Ranking ---
+function rankResults(results) {
+  const eligible = results.filter(r => r.eligibility.is_eligible);
+  const ineligible = results.filter(r => !r.eligibility.is_eligible);
+
+  const groups = new Map();
+  for (const r of eligible) {
+    const k = `${r.investor_code}::${r.product_code}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
+  }
+
+  for (const [, group] of groups) {
+    group.sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
+    let parIdx = 0, closest = Math.abs(group[0].pricing.final_price_points - 100);
+    for (let i = 1; i < group.length; i++) {
+      const d = Math.abs(group[i].pricing.final_price_points - 100);
+      if (d < closest) { closest = d; parIdx = i; }
+    }
+    for (let i = 0; i < group.length; i++) {
+      const fp = group[i].pricing.final_price_points;
+      if (i === parIdx) { group[i].is_par_rate = true; group[i].rate_option = "par"; }
+      else if (fp < 100) { group[i].is_par_rate = false; group[i].rate_option = "below_par"; }
+      else { group[i].is_par_rate = false; group[i].rate_option = "above_par"; }
+    }
+    group.sort((a, b) => a.pricing.apr - b.pricing.apr);
+    group.forEach((r, i) => { r.product_rank = i + 1; });
+  }
+
+  eligible.sort((a, b) => a.pricing.apr - b.pricing.apr);
+  eligible.forEach((r, i) => { r.rank = i + 1; });
+  ineligible.forEach(r => { r.rank = 0; r.product_rank = 0; r.is_par_rate = false; r.rate_option = "below_par"; });
+  return [...eligible, ...ineligible];
+}
+
+// =============================================
+// SUPABASE QUERIES
+// =============================================
+
+async function runPricing(client, scenario) {
+  const start = Date.now();
+  const errors = [];
+  const results = [];
+
+  // Get all investors
+  const { data: investors, error: invErr } = await client.from("investors").select("id, name, code, channel");
+  if (invErr) throw new Error(`Investors query failed: ${invErr.message}. Check that you are using the service_role key (not anon key) to bypass RLS.`);
+  if (!investors || investors.length === 0) {
+    errors.push("No investors found. This usually means RLS is blocking reads — make sure you are using the service_role key, not the anon key.");
+  }
+
+  for (const inv of (investors || [])) {
+    try {
+      // Active rate sheets
+      const { data: sheets } = await client.from("rate_sheets")
+        .select("id, investor_id, effective_date, version, status")
+        .eq("investor_id", inv.id).eq("status", "active")
+        .order("effective_date", { ascending: false });
+      if (!sheets?.length) { errors.push(`No active rate sheet: ${inv.code}`); continue; }
+
+      // Config
+      const { data: config } = await client.from("investor_configs")
+        .select("*").eq("investor_id", inv.id).eq("channel", inv.channel).limit(1).single();
+      if (!config) { errors.push(`No config: ${inv.code}`); continue; }
+
+      // Products
+      const { data: products } = await client.from("investor_products")
+        .select(`id, investor_id, product_id, investor_product_code, channel, is_available,
+          min_fico, max_ltv_ratio, max_cltv_ratio, max_dti_ratio, state_availability, state_exclusions,
+          products(id, name, code, category, lien_position, amortization, term_months)`)
+        .eq("investor_id", inv.id).eq("channel", inv.channel).eq("is_available", true);
+      if (!products?.length) { errors.push(`No products: ${inv.code}`); continue; }
+
+      // Load all rate data across all sheets
+      let allBaseRates = [], allMatrices = [];
+      for (const sheet of sheets) {
+        const [brRes, mRes] = await Promise.all([
+          client.from("base_rates").select("id, rate_sheet_id, product_id, investor_product_code, term_months, lock_period_days, rate_percent, price_points").eq("rate_sheet_id", sheet.id),
+          client.from("llpa_matrices").select("id, rate_sheet_id, name, matrix_type, dimension_1_name, dimension_1_type, dimension_2_name, dimension_2_type, applies_to_product_categories, notes").eq("rate_sheet_id", sheet.id),
+        ]);
+        if (brRes.data) allBaseRates.push(...brRes.data);
+        if (mRes.data) allMatrices.push(...mRes.data);
+      }
+
+      // Load entries in chunks
+      const matrixIds = allMatrices.map(m => m.id);
+      let allEntries = [];
+      for (let i = 0; i < matrixIds.length; i += 30) {
+        const chunk = matrixIds.slice(i, i + 30);
+        const { data: entries } = await client.from("llpa_entries")
+          .select("id, matrix_id, dimension_1_min, dimension_1_max, dimension_1_label, dimension_1_exact_values, dimension_2_min, dimension_2_max, dimension_2_label, adjustment_bps, adjustment_price_points")
+          .in("matrix_id", chunk);
+        if (entries) allEntries.push(...entries);
+      }
+
+      const comp = calculateComp(scenario.loan_amount, config);
+
+      // Price each product
+      for (const ip of products) {
+        const product = ip.products;
+        if (!product) continue;
+
+        const elig = checkEligibility(scenario, ip, product.category);
+
+        // Non-QM products: enforce minimum 45-day lock period
+        const isNQM = (product.category || '').toLowerCase().startsWith('nqm') || (product.code || '').toUpperCase().startsWith('NQM');
+        const effectiveLockDays = isNQM ? Math.max(scenario.lock_days, 45) : scenario.lock_days;
+
+        // Find base rates
+        let rates = allBaseRates
+          .filter(r => r.product_id === product.id && r.term_months === scenario.term_months && r.lock_period_days === effectiveLockDays)
+          .sort((a, b) => a.rate_percent - b.rate_percent);
+
+        if (!rates.length && scenario.term_months !== product.term_months) {
+          rates = allBaseRates
+            .filter(r => r.product_id === product.id && r.term_months === product.term_months && r.lock_period_days === effectiveLockDays)
+            .sort((a, b) => a.rate_percent - b.rate_percent);
+        }
+
+        if (!rates.length) {
+          if (elig.is_eligible) errors.push(`No base rate: ${product.code} @ ${scenario.term_months}mo/${effectiveLockDays}d`);
+          if (!elig.is_eligible) {
+            results.push({
+              rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name,
+              product_code: product.code, product_name: product.name, product_category: product.category,
+              term_months: scenario.term_months, rate_sheet_date: sheets[0].effective_date,
+              rate_option: "below_par", is_par_rate: false,
+              eligibility: elig, pricing: null, llpa_breakdown: [],
+            });
+          }
+          continue;
+        }
+
+        const llpaResult = applyLLPAs(allMatrices, allEntries, scenario, product.category);
+
+        // Calculate mortgage insurance once per product (FHA MIP, VA Fee, or conventional PMI)
+        const representativeRate = rates.length > 0 ? rates[Math.floor(rates.length / 2)].rate_percent : 7.0;
+        const govIns = calcGovInsurance(
+          product.category, scenario.loan_amount, scenario.property_value,
+          scenario.ltv_ratio, rates[0].term_months, scenario.purpose,
+          scenario.is_first_va_use ?? true, scenario.is_va_funding_fee_exempt ?? false,
+          scenario.fico_score, representativeRate
+        );
+
+        for (const br of rates) {
+          const fp = br.price_points + llpaResult.total_points;
+          // Total loan amount includes financed upfront fee
+          const totalLoan = govIns.upfront_financed ? scenario.loan_amount + govIns.upfront_fee_amount : scenario.loan_amount;
+          // P&I calculated on total loan amount
+          const pi = monthlyPI(totalLoan, br.rate_percent, br.term_months);
+          // Total monthly = P&I + monthly MI
+          const totalMonthly = pi + govIns.monthly_amount;
+          // APR on total loan amount
+          const apr = calcAPR(totalLoan, br.rate_percent, fp, br.term_months);
+
+          results.push({
+            rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name,
+            product_code: product.code, product_name: product.name, product_category: product.category,
+            term_months: br.term_months, rate_sheet_date: sheets[0].effective_date,
+            rate_option: "par", is_par_rate: false,
+            eligibility: elig,
+            pricing: {
+              base_rate_percent: br.rate_percent, base_price_points: br.price_points,
+              total_llpa_points: llpaResult.total_points, comp_dollars: comp.comp_dollars,
+              comp_points: comp.comp_points, final_price_points: fp,
+              final_rate_percent: br.rate_percent, apr, monthly_pi: pi,
+              estimated_closing_costs: Math.round(scenario.loan_amount * 0.015),
+              government_insurance: govIns,
+              total_loan_amount: totalLoan,
+              total_monthly_payment: totalMonthly,
+            },
+            llpa_breakdown: llpaResult.details,
+          });
+        }
+      }
+    } catch (e) {
+      errors.push(`${inv.code}: ${e.message}`);
+    }
+  }
+
+  const ranked = rankResults(results);
+  return {
+    results: ranked, errors,
+    meta: {
+      execution_ms: Date.now() - start,
+      investors_queried: investors?.length || 0,
+      total_rate_options: ranked.filter(r => r.eligibility.is_eligible && r.pricing).length,
+      products_eligible: new Set(ranked.filter(r => r.eligibility.is_eligible && r.pricing).map(r => r.product_code)).size,
+      products_ineligible: new Set(ranked.filter(r => !r.eligibility.is_eligible).map(r => r.product_code)).size,
+    },
+  };
+}
+
+// =============================================
+// REACT UI COMPONENTS
+// =============================================
+
+// --- Loan Summary Display Component ---
+function LoanSummary({ summary }) {
+  const fmt = (v) => {
+    if (v < 0) return `($${Math.abs(v).toLocaleString()})`;
+    return `$${v.toLocaleString()}`;
+  };
+  const fmtC = (v) => `$${v.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}`;
+  const isCredit = summary.total_lender_costs < 0;
+
+  return (
+    <div style={{padding:'8px 16px 12px', fontSize:12, background:'rgba(56,189,248,0.03)', borderBottom:'1px solid var(--bg3)'}}>
+      <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:'0 24px', maxWidth:520}}>
+        {/* Left column: Costs */}
+        <div>
+          <div style={{fontWeight:600, color:'var(--accent)', fontSize:11, textTransform:'uppercase', marginBottom:4}}>
+            Costs & Cash to Close
+          </div>
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Interest Rate</span>
+            <span style={{fontWeight:700, color:'var(--accent)'}}>{summary.interest_rate.toFixed(3)}%</span>
+          </div>
+          <div style={{borderTop:'1px solid var(--bg3)', margin:'3px 0'}} />
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Cost of Interest Rate</span>
+            <span style={{color: summary.cost_of_rate > 0 ? 'var(--red)' : summary.cost_of_rate < 0 ? 'var(--green)' : 'var(--text)', fontStyle:'italic'}}>
+              {fmt(summary.cost_of_rate)}
+            </span>
+          </div>
+          {summary.cost_of_mi > 0 && (
+            <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+              <span style={{color:'var(--text2)'}}>
+                {summary.gi_type === 'fha_mip' ? 'UFMIP' : summary.gi_type === 'va_funding_fee' ? 'VA Funding Fee' : 'MI Cost'}
+                {' '}<span style={{color:'var(--text3)', fontSize:10}}>(financed)</span>
+              </span>
+              <span style={{fontStyle:'italic'}}>{fmt(Math.round(summary.cost_of_mi))}</span>
+            </div>
+          )}
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Other Lender Costs{summary.fees_in ? ' (in rate)' : ' (proc+UW)'}</span>
+            <span style={{fontStyle:'italic'}}>{fmt(summary.other_lender_costs)}</span>
+          </div>
+          <div style={{display:'flex', justifyContent:'space-between', padding:'2px 0', fontWeight:600, borderTop:'1px solid var(--bg3)', marginTop:2}}>
+            <span>Total Lender {isCredit ? 'Credits' : 'Costs'}</span>
+            <span style={{color: isCredit ? 'var(--green)' : 'var(--text)'}}>{fmt(summary.total_lender_costs)}</span>
+          </div>
+          <div style={{borderTop:'1px solid var(--bg3)', margin:'3px 0'}} />
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Other Closing Costs</span>
+            <span style={{fontStyle:'italic'}}>{fmt(summary.other_closing_costs)}</span>
+          </div>
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Down Payment</span>
+            <span style={{fontStyle:'italic'}}>{fmt(summary.down_payment)}</span>
+          </div>
+          <div style={{display:'flex', justifyContent:'space-between', padding:'3px 0', fontWeight:700, borderTop:'1px solid var(--border)', marginTop:3, fontSize:13}}>
+            <span>Cash to Close</span>
+            <span style={{color: summary.cash_to_close < 0 ? 'var(--green)' : 'var(--text)'}}>{fmt(summary.cash_to_close)}</span>
+          </div>
+        </div>
+
+        {/* Right column: Monthly & Loan Amount */}
+        <div>
+          <div style={{fontWeight:600, color:'var(--accent)', fontSize:11, textTransform:'uppercase', marginBottom:4}}>
+            Monthly Payment & Debt
+          </div>
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Loan Amount (debt)</span>
+            <span style={{fontWeight:600}}>{fmtC(summary.loan_debt)}</span>
+          </div>
+          <div style={{borderTop:'1px solid var(--bg3)', margin:'3px 0'}} />
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Monthly P&I</span>
+            <span style={{fontStyle:'italic'}}>{fmtC(summary.monthly_pi)}</span>
+          </div>
+          {summary.monthly_mi > 0 && (
+            <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+              <span style={{color:'var(--text2)'}}>
+                {summary.gi_type === 'conventional_pmi' ? 'Monthly PMI' : 'Monthly MI'}
+                {(summary.gi_type === 'fha_mip' || summary.gi_type === 'conventional_pmi') && <span style={{color:'var(--text3)', fontSize:10}}> ({summary.gi_duration})</span>}
+              </span>
+              <span style={{fontStyle:'italic'}}>{fmtC(summary.monthly_mi)}</span>
+            </div>
+          )}
+          <div style={{display:'flex', justifyContent:'space-between', padding:'1px 0'}}>
+            <span style={{color:'var(--text2)'}}>Monthly Escrow <span style={{color:'var(--text3)', fontSize:10}}>(est.)</span></span>
+            <span style={{fontStyle:'italic'}}>{fmtC(summary.monthly_escrow)}</span>
+          </div>
+          <div style={{display:'flex', justifyContent:'space-between', padding:'3px 0', fontWeight:700, borderTop:'1px solid var(--border)', marginTop:3, fontSize:13}}>
+            <span>Total Monthly</span>
+            <span>{fmtC(summary.total_monthly)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayOpts }) {
+  const first = group[0];
+  const parRate = group.find(r => r.is_par_rate);
+  const sorted = [...group].sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
+  const displayed = showAll ? sorted : sorted.slice(0, 7);
+  const hasMore = sorted.length > 7;
+
+  const [expanded, setExpanded] = useState(true);
+  const [showLLPA, setShowLLPA] = useState(false);
+  const [selectedRateIdx, setSelectedRateIdx] = useState(null); // index into sorted array
+
+  // Which rate to show summary for: selected or par rate
+  const summaryRate = selectedRateIdx !== null ? sorted[selectedRateIdx] : parRate;
+  const summary = summaryRate && scenario ? calcLoanSummary(summaryRate, scenario, displayOpts) : null;
+
+  return (
+    <div className="product-group">
+      <div className="product-header" onClick={() => setExpanded(!expanded)}>
+        <div>
+          <span className="product-title">{first.product_code}</span>
+          <span style={{color:'var(--text3)', fontSize:12, marginLeft:8}}>{first.product_name}</span>
+        </div>
+        <div className="product-badges">
+          <span className="product-category">{first.product_category}</span>
+          <span style={{fontSize:11, color:'var(--text3)'}}>{group.length} rates</span>
+          <span style={{fontSize:14, color:'var(--text3)'}}>{expanded ? '▾' : '▸'}</span>
+        </div>
+      </div>
+
+      {expanded && (
+        <>
+          {parRate && (
+            <div style={{padding:'4px 16px 8px'}}>
+              <div className="par-highlight">
+                <span className="rate">{parRate.pricing.base_rate_percent.toFixed(3)}%</span>
+                <span className="detail">par rate</span>
+                <span className="detail">|</span>
+                <span className="detail">${parRate.pricing.monthly_pi.toLocaleString()}/mo P&I</span>
+                {parRate.pricing.government_insurance?.type !== "none" && parRate.pricing.government_insurance?.monthly_amount > 0 && (
+                  <>
+                    <span className="detail">|</span>
+                    <span className="detail" style={{color:'var(--orange)'}}>${parRate.pricing.total_monthly_payment.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}/mo total</span>
+                  </>
+                )}
+                <span className="detail">|</span>
+                <span className="detail">{parRate.pricing.apr.toFixed(4)}% APR</span>
+                <span className="detail">|</span>
+                <span className="detail">Price: {parRate.pricing.final_price_points.toFixed(4)}</span>
+              </div>
+            </div>
+          )}
+
+          <div className="comp-display">
+            Comp: ${first.pricing.comp_dollars.toFixed(0)} ({first.pricing.comp_points.toFixed(3)} pts)
+            {' · '}
+            LLPA Total: {first.pricing.total_llpa_points >= 0 ? '+' : ''}{first.pricing.total_llpa_points.toFixed(4)} pts
+            {first.llpa_breakdown.length > 0 && (
+              <span style={{marginLeft:8, color:'var(--accent)', cursor:'pointer', fontSize:11}} onClick={(e) => { e.stopPropagation(); setShowLLPA(!showLLPA); }}>
+                [{showLLPA ? 'hide' : 'show'} breakdown]
+              </span>
+            )}
+          </div>
+
+          {first.pricing.government_insurance && first.pricing.government_insurance.type !== "none" && (
+            <div style={{padding:'4px 16px 8px', fontSize:12, color:'var(--text2)', background:'rgba(56,189,248,0.05)', borderBottom:'1px solid var(--bg3)'}}>
+              <div style={{fontWeight:600, color:'var(--accent)', fontSize:11, textTransform:'uppercase', marginBottom:2}}>
+                {first.pricing.government_insurance.type === "fha_mip" ? "FHA Mortgage Insurance"
+                  : first.pricing.government_insurance.type === "va_funding_fee" ? "VA Funding Fee"
+                  : first.pricing.government_insurance.type === "conventional_pmi" ? "Private Mortgage Insurance (PMI)"
+                  : "Mortgage Insurance"}
+              </div>
+              <div style={{display:'flex', gap:16, flexWrap:'wrap'}}>
+                {first.pricing.government_insurance.upfront_fee_amount > 0 && (
+                  <span>
+                    Upfront: {first.pricing.government_insurance.upfront_fee_percent.toFixed(2)}%
+                    {' = '}${first.pricing.government_insurance.upfront_fee_amount.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}
+                    {first.pricing.government_insurance.upfront_financed && <span style={{color:'var(--text3)'}}> (financed)</span>}
+                  </span>
+                )}
+                {first.pricing.government_insurance.annual_rate_percent > 0 && (
+                  <span>
+                    {first.pricing.government_insurance.type === "conventional_pmi" ? "Annual PMI" : "Annual MIP"}: {first.pricing.government_insurance.annual_rate_percent.toFixed(2)}%
+                    {' = '}${first.pricing.government_insurance.monthly_amount.toFixed(2)}/mo
+                  </span>
+                )}
+                {first.pricing.government_insurance.duration_label && first.pricing.government_insurance.duration_label !== "N/A" && (
+                  <span>Duration: {first.pricing.government_insurance.duration_label}</span>
+                )}
+                {first.pricing.government_insurance.upfront_financed && (
+                  <span>Total Loan: ${first.pricing.total_loan_amount.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {summary && <LoanSummary summary={summary} />}
+
+          {showLLPA && first.llpa_breakdown.length > 0 && (
+            <div className="llpa-summary">
+              {first.llpa_breakdown.map((l, i) => (
+                <div className="llpa-detail" key={i}>
+                  <span>{l.matrix_name}</span>
+                  <span className={`llpa-value ${l.adjustment_points < 0 ? 'neg' : l.adjustment_points > 0 ? 'pos' : ''}`}>
+                    {l.adjustment_points >= 0 ? '+' : ''}{l.adjustment_points.toFixed(4)}
+                  </span>
+                </div>
+              ))}
+              <div className="llpa-detail llpa-total">
+                <span>Total</span>
+                <span className={`llpa-value ${first.pricing.total_llpa_points < 0 ? 'neg' : 'pos'}`}>
+                  {first.pricing.total_llpa_points >= 0 ? '+' : ''}{first.pricing.total_llpa_points.toFixed(4)}
+                </span>
+              </div>
+            </div>
+          )}
+
+          <table className="rate-table">
+            <thead>
+              <tr>
+                <th>Rate</th>
+                <th>Base Price</th>
+                <th>Final Price</th>
+                <th>Monthly P&I</th>
+                {first.pricing.government_insurance?.type !== "none" && first.pricing.government_insurance?.monthly_amount > 0 && <th>Total Payment</th>}
+                <th>APR</th>
+                <th>Points Cost</th>
+                <th>Type</th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayed.map((r, i) => {
+                const pointsCost = ((100 - r.pricing.final_price_points) / 100) * r.pricing.final_price_points !== 100
+                  ? ((100 - r.pricing.final_price_points) / 100 * r.pricing.base_rate_percent) : 0;
+                const dollarCost = ((100 - r.pricing.final_price_points) / 100) * first.pricing.estimated_closing_costs / 0.015;
+                const actualDollarCost = Math.round(((100 - r.pricing.final_price_points) / 100) * (r.pricing.monthly_pi * r.term_months / (r.pricing.base_rate_percent/100*12)) );
+                // Simpler: discount points in dollars
+                const dpDollars = Math.round(((100 - r.pricing.final_price_points) / 100) * (loanAmount || 350000));
+
+                const sortedIdx = sorted.indexOf(r);
+                const isSelected = selectedRateIdx === sortedIdx;
+
+                return (
+                  <tr key={i} className={r.is_par_rate ? 'par-row' : ''} onClick={() => setSelectedRateIdx(isSelected ? null : sortedIdx)}
+                      style={{cursor:'pointer', outline: isSelected ? '1px solid var(--accent)' : 'none'}}>
+                    <td style={{fontWeight: r.is_par_rate ? 700 : 400}}>
+                      {r.pricing.base_rate_percent.toFixed(3)}%
+                    </td>
+                    <td>{r.pricing.base_price_points.toFixed(4)}</td>
+                    <td style={{color: r.pricing.final_price_points < 99.9 ? 'var(--red)' : r.pricing.final_price_points > 100.1 ? 'var(--green)' : 'var(--text)'}}>
+                      {r.pricing.final_price_points.toFixed(4)}
+                    </td>
+                    <td>${r.pricing.monthly_pi.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                    {first.pricing.government_insurance?.type !== "none" && first.pricing.government_insurance?.monthly_amount > 0 && (
+                      <td style={{fontWeight:600, color:'var(--orange)'}}>
+                        ${r.pricing.total_monthly_payment.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}
+                      </td>
+                    )}
+                    <td>{r.pricing.apr.toFixed(4)}%</td>
+                    <td style={{color: dpDollars > 0 ? 'var(--red)' : dpDollars < 0 ? 'var(--green)' : 'var(--text2)'}}>
+                      {dpDollars > 0 ? `-$${dpDollars.toLocaleString()}` : dpDollars < 0 ? `+$${Math.abs(dpDollars).toLocaleString()}` : '$0'}
+                    </td>
+                    <td>
+                      {r.is_par_rate && <span className="par-badge">PAR</span>}
+                      {r.rate_option === "below_par" && !r.is_par_rate && <span className="discount-badge">discount</span>}
+                      {r.rate_option === "above_par" && <span className="credit-badge">credit</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {hasMore && !showAll && (
+            <div className="show-more">
+              <button onClick={onToggle}>Show all {sorted.length} rates</button>
+            </div>
+          )}
+          {hasMore && showAll && (
+            <div className="show-more">
+              <button onClick={onToggle}>Show fewer</button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [supabaseUrl, setSupabaseUrl] = useState('');
+  const [supabaseKey, setSupabaseKey] = useState('');
+  const [connected, setConnected] = useState(null); // null | true | false
+  const [loading, setLoading] = useState(false);
+  const [response, setResponse] = useState(null);
+  const [expandedProducts, setExpandedProducts] = useState({});
+  const clientRef = useRef(null);
+
+  // Form state
+  const [form, setForm] = useState({
+    loan_amount: 350000,
+    property_value: 500000,
+    fico_score: 740,
+    purpose: 'purchase',
+    property_type: 'single_family',
+    occupancy: 'primary_residence',
+    state_code: 'NC',
+    dti_ratio: '',
+    num_units: '',
+    preferred_lock_days: 45,      // Will be auto-set by getDefaultLockDays
+    preferred_term_months: 360,
+    // Scenario flags
+    is_veteran: false,            // Veteran — required for VA product eligibility
+    is_first_va_use: true,        // First time using VA benefit (only relevant if veteran)
+    is_va_funding_fee_exempt: false,
+    subordination: false,         // Refi with existing 2nd lien staying in place
+    self_employed: false,         // Self-employed borrower
+    is_first_time_buyer: false,   // First-time homebuyer
+    is_ami_below_80: false,       // Borrower income ≤80% AMI → FNMA LLPA waiver on conventional
+    // Pricing display options
+    origination_fee: 1500,        // Lender origination / UW fee ($)
+    fees_in: false,               // false = fees-out (fees shown separately), true = fees baked into rate/price
+    escrow_annual_rate: 1.25,     // Annual escrow estimate as % of property value (taxes + insurance)
+  });
+
+  const updateForm = (field, value) => setForm(prev => ({...prev, [field]: value}));
+
+  // --- Default Lock Period Logic ---
+  // Priority: longest applicable lock wins.
+  // 1. Refi + subordination → 60 days
+  // 2. Condo → 60 days
+  // 3. Purchase → 45 days
+  // 4. Self-employed → 45 days
+  // 5. All other → 30 days
+  // Note: Non-QM 45-day minimum is applied per-product in the pricing engine, not here.
+  function getDefaultLockDays(f) {
+    let lockDays = 30; // base default
+    // Purchase → 45 days
+    if (f.purpose === 'purchase') lockDays = Math.max(lockDays, 45);
+    // Self-employed → 45 days
+    if (f.self_employed) lockDays = Math.max(lockDays, 45);
+    // Condo → 60 days
+    if (f.property_type === 'condo') lockDays = Math.max(lockDays, 60);
+    // Refi + subordination → 60 days
+    const isRefi = f.purpose === 'rate_term_refi' || f.purpose === 'cash_out_refi';
+    if (isRefi && f.subordination) lockDays = Math.max(lockDays, 60);
+    return lockDays;
+  }
+
+  // Auto-update lock period when relevant fields change
+  useEffect(() => {
+    const newLock = getDefaultLockDays(form);
+    if (Number(form.preferred_lock_days) !== newLock) {
+      setForm(prev => ({ ...prev, preferred_lock_days: newLock }));
+    }
+  }, [form.purpose, form.property_type, form.subordination, form.self_employed]);
+
+  // Currency formatting helper
+  const formatCurrency = (val) => {
+    const num = Number(String(val).replace(/,/g, ''));
+    if (isNaN(num) || num === 0) return '';
+    return num.toLocaleString('en-US');
+  };
+  const parseCurrency = (val) => String(val).replace(/,/g, '');
+
+  // Connect to Supabase
+  const connect = useCallback(() => {
+    if (!supabaseUrl || !supabaseKey) return;
+    try {
+      const client = supabase.createClient(supabaseUrl, supabaseKey);
+      clientRef.current = client;
+      // Test connection
+      client.from("investors").select("id").limit(1).then(({error}) => {
+        setConnected(error ? false : true);
+      });
+    } catch (err) {
+      console.error("Connection error:", err);
+      setConnected(false);
+    }
+  }, [supabaseUrl, supabaseKey]);
+
+  // Run pricing
+  const runPrice = useCallback(async () => {
+    if (!clientRef.current) return;
+
+    const scenario = {
+      ...form,
+      loan_amount: Number(form.loan_amount),
+      property_value: Number(form.property_value),
+      fico_score: Number(form.fico_score),
+      preferred_lock_days: Number(form.preferred_lock_days),
+      preferred_term_months: Number(form.preferred_term_months),
+      dti_ratio: form.dti_ratio ? Number(form.dti_ratio) : undefined,
+      num_units: form.num_units ? Number(form.num_units) : undefined,
+      is_first_va_use: form.is_first_va_use,
+      is_va_funding_fee_exempt: form.is_va_funding_fee_exempt,
+    };
+
+    const { errors, resolved } = validateAndResolve(scenario);
+    if (errors.length) {
+      setResponse({ errors, results: [], meta: {} });
+      return;
+    }
+
+    setLoading(true);
+    setResponse(null);
+    try {
+      const res = await runPricing(clientRef.current, resolved);
+      setResponse(res);
+    } catch (e) {
+      setResponse({ errors: [e.message], results: [], meta: {} });
+    }
+    setLoading(false);
+  }, [form]);
+
+  // Group results by product
+  const eligibleGroups = [];
+  const ineligibleResults = [];
+  if (response?.results) {
+    const gmap = new Map();
+    for (const r of response.results) {
+      if (r.eligibility.is_eligible && r.pricing) {
+        const k = `${r.investor_code}::${r.product_code}`;
+        if (!gmap.has(k)) gmap.set(k, []);
+        gmap.get(k).push(r);
+      } else if (!r.eligibility.is_eligible) {
+        ineligibleResults.push(r);
+      }
+    }
+    // Sort groups by best APR in each group
+    for (const [k, group] of gmap) {
+      const bestApr = Math.min(...group.map(r => r.pricing.apr));
+      eligibleGroups.push({ key: k, group, bestApr });
+    }
+    eligibleGroups.sort((a, b) => a.bestApr - b.bestApr);
+  }
+
+  // Dedupe ineligible by product code
+  const ineligibleDeduped = [];
+  const seen = new Set();
+  for (const r of ineligibleResults) {
+    if (!seen.has(r.product_code)) {
+      seen.add(r.product_code);
+      ineligibleDeduped.push(r);
+    }
+  }
+
+  return (
+    <div className="app">
+      <div className="header">
+        <h1>Hatch PPE — Pricing Test Tool</h1>
+        <div className="meta">v1.0 · Planet Home Lending data loaded</div>
+      </div>
+
+      <div className="conn-bar">
+        <label>Supabase URL:</label>
+        <input value={supabaseUrl} onChange={e => setSupabaseUrl(e.target.value)} placeholder="https://xxxxx.supabase.co" />
+        <label>Key:</label>
+        <input type="password" value={supabaseKey} onChange={e => setSupabaseKey(e.target.value)} placeholder="service_role key" />
+        <button className="btn" style={{background:'var(--bg3)', color:'var(--text)', padding:'4px 12px', fontSize:12}} onClick={connect}>
+          Connect
+        </button>
+        {connected === true && <span className="conn-status ok">Connected</span>}
+        {connected === false && <span className="conn-status err">Failed</span>}
+      </div>
+
+      <div className="main">
+        <div className="panel-left">
+          <div className="form-section">
+            <h3>Loan Details</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Loan Amount</label>
+                <input type="text" value={formatCurrency(form.loan_amount)} onChange={e => updateForm('loan_amount', parseCurrency(e.target.value))} />
+              </div>
+              <div className="form-group">
+                <label>Property Value</label>
+                <input type="text" value={formatCurrency(form.property_value)} onChange={e => updateForm('property_value', parseCurrency(e.target.value))} />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>FICO Score</label>
+                <input type="number" value={form.fico_score} onChange={e => updateForm('fico_score', e.target.value)} />
+              </div>
+              <div className="form-group">
+                <label>DTI % (optional)</label>
+                <input type="number" value={form.dti_ratio} onChange={e => updateForm('dti_ratio', e.target.value)} placeholder="e.g. 38" />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group" style={{flex:2}}>
+                <label>LTV (calculated)</label>
+                <input readOnly value={form.loan_amount && form.property_value ? ((Number(form.loan_amount)/Number(form.property_value))*100).toFixed(2) + '%' : '--'} style={{color:'var(--accent)', fontWeight:600}} />
+              </div>
+            </div>
+          </div>
+
+          <div className="form-section">
+            <h3>Loan Purpose & Property</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Purpose</label>
+                <select value={form.purpose} onChange={e => updateForm('purpose', e.target.value)}>
+                  <option value="purchase">Purchase</option>
+                  <option value="rate_term_refi">Rate/Term Refi</option>
+                  <option value="cash_out_refi">Cash-Out Refi</option>
+                  <option value="heloc">HELOC</option>
+                  <option value="heloan">HELOAN</option>
+                </select>
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Property Type</label>
+                <select value={form.property_type} onChange={e => updateForm('property_type', e.target.value)}>
+                  <option value="single_family">Single Family</option>
+                  <option value="condo">Condo</option>
+                  <option value="townhome">Townhome</option>
+                  <option value="multi_unit_2">2-Unit</option>
+                  <option value="multi_unit_3">3-Unit</option>
+                  <option value="multi_unit_4">4-Unit</option>
+                  <option value="manufactured_home">Manufactured</option>
+                  <option value="pud">PUD</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Occupancy</label>
+                <select value={form.occupancy} onChange={e => updateForm('occupancy', e.target.value)}>
+                  <option value="primary_residence">Primary</option>
+                  <option value="secondary_residence">Second Home</option>
+                  <option value="investment_property">Investment</option>
+                </select>
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>State</label>
+                <input value={form.state_code} onChange={e => updateForm('state_code', e.target.value.toUpperCase())} maxLength={2} placeholder="NC" />
+              </div>
+              <div className="form-group">
+                <label>Units (if multi)</label>
+                <input type="number" value={form.num_units} onChange={e => updateForm('num_units', e.target.value)} placeholder="1" />
+              </div>
+            </div>
+          </div>
+
+          <div className="form-section">
+            <h3>Rate Options</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Lock Period (days)</label>
+                <select value={form.preferred_lock_days} onChange={e => updateForm('preferred_lock_days', Number(e.target.value))}>
+                  <option value={15}>15</option>
+                  <option value={30}>30</option>
+                  <option value={45}>45</option>
+                  <option value={60}>60</option>
+                </select>
+                {(() => {
+                  const autoLock = getDefaultLockDays(form);
+                  const reasons = [];
+                  if ((form.purpose === 'rate_term_refi' || form.purpose === 'cash_out_refi') && form.subordination) reasons.push('subordination');
+                  if (form.property_type === 'condo') reasons.push('condo');
+                  if (form.purpose === 'purchase') reasons.push('purchase');
+                  if (form.self_employed) reasons.push('self-employed');
+                  if (reasons.length > 0) {
+                    return <div style={{fontSize:10, color:'var(--accent)', marginTop:2}}>Auto: {autoLock}d ({reasons.join(', ')})</div>;
+                  }
+                  return null;
+                })()}
+              </div>
+              <div className="form-group">
+                <label>Term</label>
+                <select value={form.preferred_term_months} onChange={e => updateForm('preferred_term_months', e.target.value)}>
+                  <option value={360}>30-year</option>
+                  <option value={300}>25-year</option>
+                  <option value={240}>20-year</option>
+                  <option value={180}>15-year</option>
+                  <option value={120}>10-year</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="form-section">
+            <h3>Pricing Display</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Origination Fee ($)</label>
+                <input type="text" value={formatCurrency(form.origination_fee)} onChange={e => updateForm('origination_fee', parseCurrency(e.target.value))} />
+              </div>
+              <div className="form-group">
+                <label>Escrow Rate (% of value)</label>
+                <input type="number" step="0.25" value={form.escrow_annual_rate} onChange={e => updateForm('escrow_annual_rate', e.target.value)} />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.fees_in} onChange={e => updateForm('fees_in', e.target.checked)} style={{width:'auto'}} />
+                  Fees-In Pricing
+                </label>
+                <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
+                  {form.fees_in ? 'Origination fee baked into rate/price. No separate fee line.' : 'Origination fee shown as separate lender cost.'}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="form-section">
+            <h3>Scenario Flags</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.self_employed} onChange={e => updateForm('self_employed', e.target.checked)} style={{width:'auto'}} />
+                  Self-Employed
+                </label>
+              </div>
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.is_first_time_buyer} onChange={e => updateForm('is_first_time_buyer', e.target.checked)} style={{width:'auto'}} />
+                  First-Time Homebuyer
+                </label>
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.is_ami_below_80} onChange={e => updateForm('is_ami_below_80', e.target.checked)} style={{width:'auto'}} />
+                  AMI &lt;80%
+                </label>
+              </div>
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.is_veteran} onChange={e => updateForm('is_veteran', e.target.checked)} style={{width:'auto'}} />
+                  Veteran
+                </label>
+              </div>
+            </div>
+            <div className="form-row">
+              {(form.purpose === 'rate_term_refi' || form.purpose === 'cash_out_refi') && (
+                <div className="form-group">
+                  <label style={{display:'flex', alignItems:'center', gap:6}}>
+                    <input type="checkbox" checked={form.subordination} onChange={e => updateForm('subordination', e.target.checked)} style={{width:'auto'}} />
+                    Subordination
+                  </label>
+                </div>
+              )}
+            </div>
+            <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
+              {form.is_ami_below_80 ? 'AMI ≤80%: FNMA primary LLPA waiver on conventional (purchase/refi, primary res). ' : ''}
+              {form.is_first_time_buyer ? 'First-time homebuyer flagged. ' : ''}
+              {form.self_employed ? 'Self-employed: lock defaults to 45+ days. ' : ''}
+              {form.is_veteran ? 'Veteran: VA products eligible. ' : ''}
+              {form.subordination ? 'Subordination: lock defaults to 60 days. ' : ''}
+              {!form.self_employed && !form.subordination && !form.is_first_time_buyer && !form.is_ami_below_80 && !form.is_veteran
+                ? 'Check applicable flags. These affect eligibility, lock period, and LLPA calculations.' : ''}
+            </div>
+          </div>
+
+          {form.is_veteran && (
+            <div className="form-section">
+              <h3>VA Options</h3>
+              <div className="form-row">
+                <div className="form-group">
+                  <label style={{display:'flex', alignItems:'center', gap:6}}>
+                    <input type="checkbox" checked={form.is_first_va_use} onChange={e => updateForm('is_first_va_use', e.target.checked)} style={{width:'auto'}} />
+                    First VA Use
+                  </label>
+                </div>
+                <div className="form-group">
+                  <label style={{display:'flex', alignItems:'center', gap:6}}>
+                    <input type="checkbox" checked={form.is_va_funding_fee_exempt} onChange={e => updateForm('is_va_funding_fee_exempt', e.target.checked)} style={{width:'auto'}} />
+                    Funding Fee Exempt
+                  </label>
+                </div>
+              </div>
+              <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
+                First VA Use: lower funding fee for first-time benefit users. Exempt: disability, surviving spouse, Purple Heart.
+              </div>
+            </div>
+          )}
+
+          <button className="btn btn-primary" onClick={runPrice} disabled={!connected || loading}>
+            {loading ? 'Pricing...' : 'Run Pricing Engine'}
+          </button>
+        </div>
+
+        <div className="panel-right">
+          {!response && !loading && (
+            <div className="empty-state">
+              <h2>Hatch PPE</h2>
+              <p>Connect to Supabase and enter a loan scenario to see pricing results.</p>
+              <p style={{marginTop:16, fontSize:12, color:'var(--text3)'}}>
+                Queries all investors with active rate sheets. Currently loaded: Planet Home Lending (correspondent).
+              </p>
+            </div>
+          )}
+
+          {loading && (
+            <div className="loading">
+              <div className="spinner"></div>
+              <div>Running pricing engine...</div>
+            </div>
+          )}
+
+          {response && !loading && (
+            <>
+              <div className="exec-bar">
+                <div className="exec-stat"><span className="label">Time: </span><span className="value">{response.meta.execution_ms}ms</span></div>
+                <div className="exec-stat"><span className="label">Investors: </span><span className="value">{response.meta.investors_queried}</span></div>
+                <div className="exec-stat"><span className="label">Rate Options: </span><span className="value">{response.meta.total_rate_options}</span></div>
+                <div className="exec-stat"><span className="label">Products Eligible: </span><span className="value" style={{color:'var(--green)'}}>{response.meta.products_eligible}</span></div>
+                <div className="exec-stat"><span className="label">Ineligible: </span><span className="value" style={{color:'var(--red)'}}>{response.meta.products_ineligible}</span></div>
+              </div>
+
+              {response.errors?.length > 0 && (
+                <div className="warnings">
+                  <h4>Warnings / Notes ({response.errors.length})</h4>
+                  <ul>{response.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
+                </div>
+              )}
+
+              {eligibleGroups.length === 0 && ineligibleDeduped.length === 0 && (
+                <div className="empty-state">
+                  <h2>No Results</h2>
+                  <p>No products matched this scenario. Check warnings above.</p>
+                </div>
+              )}
+
+              {eligibleGroups.map(({ key, group }) => (
+                <ProductGroup
+                  key={key}
+                  group={group}
+                  showAll={expandedProducts[key] || false}
+                  onToggle={() => setExpandedProducts(prev => ({...prev, [key]: !prev[key]}))}
+                  loanAmount={Number(form.loan_amount)}
+                  scenario={{
+                    loan_amount: Number(form.loan_amount),
+                    property_value: Number(form.property_value),
+                    purpose: form.purpose,
+                  }}
+                  displayOpts={{
+                    fees_in: form.fees_in,
+                    origination_fee: Number(form.origination_fee) || 0,
+                    escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
+                  }}
+                />
+              ))}
+
+              {ineligibleDeduped.length > 0 && (
+                <>
+                  <div style={{fontSize:12, color:'var(--text3)', margin:'16px 0 8px', textTransform:'uppercase', letterSpacing:'0.05em'}}>
+                    Ineligible Products ({ineligibleDeduped.length})
+                  </div>
+                  {ineligibleDeduped.map((r, i) => (
+                    <div className="ineligible-group" key={i}>
+                      <span className="ineligible-title">{r.product_code}</span>
+                      <span style={{fontSize:12, color:'var(--text3)', marginLeft:8}}>{r.product_name}</span>
+                      {r.eligibility.knockout_reasons.map((reason, j) => (
+                        <div className="knockout-reason" key={j}>• {reason}</div>
+                      ))}
+                    </div>
+                  ))}
+                </>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App /></ErrorBoundary>);
+</script>
+</body>
+</html>
