@@ -644,6 +644,10 @@ function calcAPR(loanAmount, ratePercent, pricePoints, termMonths) {
     else apr += err > 0 ? 0.001 : -0.001;
     apr = Math.max(0.001, Math.min(30, apr));
   }
+  // Floor APR at note rate — negative points / lender credits can mathematically
+  // produce APR < rate, but industry has no consensus on treatment of rebates in APR.
+  // Flooring avoids non-comparable APRs across lenders.
+  apr = Math.max(apr, ratePercent);
   return Math.round(apr * 10000) / 10000;
 }
 
