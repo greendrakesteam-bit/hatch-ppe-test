@@ -8,6 +8,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
 <style>
   :root {
     --bg: #0f172a; --bg2: #1e293b; --bg3: #334155;
@@ -123,6 +124,7 @@
   .show-more { text-align: center; padding: 6px; }
   .show-more button { background: none; border: 1px solid var(--border); color: var(--text2); padding: 3px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; }
   .show-more button:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-excel:hover { background: var(--accent2) !important; color: white !important; }
 </style>
 </head>
 <body>
@@ -678,6 +680,170 @@ function rankResults(results) {
   eligible.forEach((r, i) => { r.rank = i + 1; });
   ineligible.forEach(r => { r.rank = 0; r.product_rank = 0; r.is_par_rate = false; r.rate_option = "below_par"; });
   return [...eligible, ...ineligible];
+}
+
+// =============================================
+// PRODUCT DISPLAY ORDER
+// =============================================
+
+const PRODUCT_PRIORITY = {
+  'CONV30': 1, 'CONV25': 2, 'CONV20': 3, 'CONV15': 4, 'CONV10': 5,
+  'FHA30': 6, 'FHA30_HB': 7, 'FHA30_203K': 8,
+  'VA30': 20, 'VA30_HB': 21,
+};
+const VA_PRODUCT_PRIORITY = {
+  'VA30': 1, 'VA30_HB': 2,
+  'CONV30': 3, 'CONV25': 4, 'CONV20': 5, 'CONV15': 6, 'CONV10': 7,
+  'FHA30': 8, 'FHA30_HB': 9, 'FHA30_203K': 10,
+};
+
+function getProductSortOrder(productCode, isVeteran) {
+  const map = isVeteran ? VA_PRODUCT_PRIORITY : PRODUCT_PRIORITY;
+  return map[productCode] ?? 99;
+}
+
+// =============================================
+// EXCEL DOWNLOAD
+// =============================================
+
+function downloadPricingExcel(response, eligibleGroups, form) {
+  if (!window.XLSX) { alert('SheetJS library not loaded'); return; }
+  const wb = XLSX.utils.book_new();
+
+  // --- Sheet 1: All Rate Options ---
+  const rows = [];
+  for (const { group } of eligibleGroups) {
+    for (const r of group) {
+      rows.push({
+        'Investor': r.investor_code,
+        'Product': r.product_code,
+        'Category': r.product_category,
+        'Term (mo)': r.term_months,
+        'Rate %': r.pricing.base_rate_percent,
+        'Base Price': r.pricing.base_price_points,
+        'Total LLPA': r.pricing.total_llpa_points,
+        'Comp $': r.pricing.comp_dollars,
+        'Comp Pts': r.pricing.comp_points,
+        'Final Price': r.pricing.final_price_points,
+        'Final Rate %': r.pricing.final_rate_percent,
+        'APR %': r.pricing.apr,
+        'Monthly P&I': r.pricing.monthly_pi,
+        'Monthly MI': r.pricing.government_insurance?.monthly_amount || 0,
+        'Total Monthly': r.pricing.total_monthly_payment,
+        'Total Loan Amt': r.pricing.total_loan_amount,
+        'Est. Closing': r.pricing.estimated_closing_costs,
+        'GI Type': r.pricing.government_insurance?.type || 'none',
+        'Upfront Fee %': r.pricing.government_insurance?.upfront_fee_percent || 0,
+        'Upfront Fee $': r.pricing.government_insurance?.upfront_fee_amount || 0,
+        'Par Rate': r.is_par_rate ? 'YES' : '',
+        'Rate Option': r.rate_option,
+        'Global Rank': r.rank,
+        'Product Rank': r.product_rank,
+      });
+    }
+  }
+  if (rows.length > 0) {
+    const ws = XLSX.utils.json_to_sheet(rows);
+    // Auto-width columns
+    ws['!cols'] = Object.keys(rows[0]).map(k => ({ wch: Math.max(k.length, 12) }));
+    XLSX.utils.book_append_sheet(wb, ws, 'All Rate Options');
+  }
+
+  // --- Sheet 2: Par Rates Summary ---
+  const parRows = [];
+  for (const { group } of eligibleGroups) {
+    const par = group.find(r => r.is_par_rate);
+    if (par) {
+      parRows.push({
+        'Investor': par.investor_code,
+        'Product': par.product_code,
+        'Category': par.product_category,
+        'Rate %': par.pricing.base_rate_percent,
+        'Final Price': par.pricing.final_price_points,
+        'APR %': par.pricing.apr,
+        'Monthly P&I': par.pricing.monthly_pi,
+        'Monthly MI': par.pricing.government_insurance?.monthly_amount || 0,
+        'Total Monthly': par.pricing.total_monthly_payment,
+        'Total Loan Amt': par.pricing.total_loan_amount,
+        'Total LLPA': par.pricing.total_llpa_points,
+      });
+    }
+  }
+  if (parRows.length > 0) {
+    const ws2 = XLSX.utils.json_to_sheet(parRows);
+    ws2['!cols'] = Object.keys(parRows[0]).map(k => ({ wch: Math.max(k.length, 12) }));
+    XLSX.utils.book_append_sheet(wb, ws2, 'Par Rates');
+  }
+
+  // --- Sheet 3: LLPA Breakdown (par rates) ---
+  const llpaRows = [];
+  for (const { group } of eligibleGroups) {
+    const par = group.find(r => r.is_par_rate);
+    if (par && par.llpa_breakdown) {
+      for (const llpa of par.llpa_breakdown) {
+        llpaRows.push({
+          'Product': par.product_code,
+          'Matrix': llpa.matrix_name,
+          'Dimension': llpa.dimension_label,
+          'Adjustment (pts)': llpa.adjustment_points,
+        });
+      }
+    }
+  }
+  if (llpaRows.length > 0) {
+    const ws3 = XLSX.utils.json_to_sheet(llpaRows);
+    ws3['!cols'] = Object.keys(llpaRows[0]).map(k => ({ wch: Math.max(k.length, 14) }));
+    XLSX.utils.book_append_sheet(wb, ws3, 'LLPA Breakdown');
+  }
+
+  // --- Sheet 4: Scenario Inputs ---
+  const scenarioRows = [
+    { 'Field': 'Loan Amount', 'Value': form.loan_amount },
+    { 'Field': 'Property Value', 'Value': form.property_value },
+    { 'Field': 'FICO', 'Value': form.fico_score },
+    { 'Field': 'Purpose', 'Value': form.purpose },
+    { 'Field': 'Property Type', 'Value': form.property_type },
+    { 'Field': 'Occupancy', 'Value': form.occupancy },
+    { 'Field': 'State', 'Value': form.state_code },
+    { 'Field': 'County', 'Value': form.county_name || '' },
+    { 'Field': 'DTI %', 'Value': form.dti_ratio || '' },
+    { 'Field': 'Veteran', 'Value': form.is_veteran ? 'Yes' : 'No' },
+    { 'Field': 'Escrow Waiver', 'Value': form.escrow_waiver },
+    { 'Field': 'Sub Lien Balance', 'Value': form.subordinate_lien_balance || 0 },
+    { 'Field': 'HELOC Limit', 'Value': form.heloc_credit_limit || 0 },
+    { 'Field': 'Origination Fee', 'Value': form.origination_fee },
+    { 'Field': 'Fees In', 'Value': form.fees_in ? 'Yes' : 'No' },
+    { 'Field': 'Escrow Annual Rate %', 'Value': form.escrow_annual_rate },
+    { 'Field': 'Products Eligible', 'Value': response.meta.products_eligible },
+    { 'Field': 'Execution Time (ms)', 'Value': response.meta.execution_ms },
+  ];
+  const ws4 = XLSX.utils.json_to_sheet(scenarioRows);
+  ws4['!cols'] = [{ wch: 22 }, { wch: 30 }];
+  XLSX.utils.book_append_sheet(wb, ws4, 'Scenario');
+
+  // --- Sheet 5: Ineligible Products ---
+  if (response.results) {
+    const ineligRows = [];
+    const seenCodes = new Set();
+    for (const r of response.results) {
+      if (!r.eligibility.is_eligible && !seenCodes.has(r.product_code)) {
+        seenCodes.add(r.product_code);
+        ineligRows.push({
+          'Product': r.product_code,
+          'Name': r.product_name,
+          'Reasons': r.eligibility.knockout_reasons.join('; '),
+        });
+      }
+    }
+    if (ineligRows.length > 0) {
+      const ws5 = XLSX.utils.json_to_sheet(ineligRows);
+      ws5['!cols'] = [{ wch: 16 }, { wch: 30 }, { wch: 60 }];
+      XLSX.utils.book_append_sheet(wb, ws5, 'Ineligible');
+    }
+  }
+
+  const filename = `PPE_${form.fico_score}FICO_${Math.round(Number(form.loan_amount)/1000)}K_${form.purpose}_${new Date().toISOString().slice(0,10)}.xlsx`;
+  XLSX.writeFile(wb, filename);
 }
 
 // =============================================
@@ -1297,7 +1463,16 @@ function App() {
       const bestApr = Math.min(...group.map(r => r.pricing.apr));
       eligibleGroups.push({ key: k, group, bestApr });
     }
-    eligibleGroups.sort((a, b) => a.bestApr - b.bestApr);
+    // Sort by custom product priority (Conv30 first, VA first if veteran), then by APR within same priority
+    const isVet = form.is_veteran;
+    eligibleGroups.sort((a, b) => {
+      const codeA = a.group[0]?.product_code || '';
+      const codeB = b.group[0]?.product_code || '';
+      const prioA = getProductSortOrder(codeA, isVet);
+      const prioB = getProductSortOrder(codeB, isVet);
+      if (prioA !== prioB) return prioA - prioB;
+      return a.bestApr - b.bestApr;
+    });
   }
 
   // Dedupe ineligible by product code
@@ -1680,6 +1855,14 @@ function App() {
                 <div className="exec-stat"><span className="label">Rate Options: </span><span className="value">{response.meta.total_rate_options}</span></div>
                 <div className="exec-stat"><span className="label">Products Eligible: </span><span className="value" style={{color:'var(--green)'}}>{response.meta.products_eligible}</span></div>
                 <div className="exec-stat"><span className="label">Ineligible: </span><span className="value" style={{color:'var(--red)'}}>{response.meta.products_ineligible}</span></div>
+                <button
+                  className="btn btn-excel"
+                  style={{background:'var(--bg3)', color:'var(--accent)', padding:'4px 14px', fontSize:12, marginLeft:'auto', border:'1px solid var(--border)'}}
+                  onClick={() => downloadPricingExcel(response, eligibleGroups, form)}
+                  title="Download all pricing results to Excel"
+                >
+                  Download Excel
+                </button>
               </div>
 
               {response.errors?.length > 0 && (
