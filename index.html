@@ -174,11 +174,37 @@ function validateAndResolve(scenario) {
   if (!scenario.state_code || !/^[A-Z]{2}$/.test(scenario.state_code)) errors.push("State must be 2-letter code");
   if (errors.length) return { errors };
 
+  // Resolve effective property value (purchase: min of price & appraisal)
+  let effPV = scenario.property_value;
+  if (scenario.purpose === 'purchase' && scenario.purchase_price && scenario.appraised_value) {
+    effPV = Math.min(scenario.purchase_price, scenario.appraised_value);
+  } else if (scenario.appraised_value) {
+    effPV = scenario.appraised_value;
+  }
+
+  // LTV rounding: truncate to 2 decimal places (floor) — most common convention
+  const rawLtv = (scenario.loan_amount / effPV) * 100;
+  const ltv_ratio = Math.floor(rawLtv * 100) / 100;
+
+  // CLTV: (loan + subordinate liens) / property value
+  const subBal = scenario.subordinate_lien_balance || 0;
+  const rawCltv = ((scenario.loan_amount + subBal) / effPV) * 100;
+  const cltv_ratio = Math.floor(rawCltv * 100) / 100;
+
+  // HCLTV: (loan + sub liens + unfunded HELOC) / property value
+  const helocLimit = scenario.heloc_credit_limit || 0;
+  const unfundedHeloc = Math.max(0, helocLimit - subBal);
+  const rawHcltv = ((scenario.loan_amount + subBal + unfundedHeloc) / effPV) * 100;
+  const hcltv_ratio = Math.floor(rawHcltv * 100) / 100;
+
   return {
     errors: [],
     resolved: {
       ...scenario,
-      ltv_ratio: (scenario.loan_amount / scenario.property_value) * 100,
+      property_value: effPV,
+      ltv_ratio,
+      cltv_ratio,
+      hcltv_ratio,
       lock_days: scenario.preferred_lock_days || 30,
       term_months: scenario.preferred_term_months || 360,
       amortization: "fixed",
@@ -196,6 +222,10 @@ function checkEligibility(scenario, ip, productCategory) {
     reasons.push(`FICO ${scenario.fico_score} below minimum ${ip.min_fico}`);
   if (ip.max_ltv_ratio != null && scenario.ltv_ratio > ip.max_ltv_ratio)
     reasons.push(`LTV ${scenario.ltv_ratio.toFixed(2)}% exceeds max ${ip.max_ltv_ratio}%`);
+  if (ip.max_cltv_ratio != null && scenario.cltv_ratio > ip.max_cltv_ratio)
+    reasons.push(`CLTV ${scenario.cltv_ratio.toFixed(2)}% exceeds max ${ip.max_cltv_ratio}%`);
+  if (ip.max_cltv_ratio != null && scenario.hcltv_ratio > ip.max_cltv_ratio)
+    reasons.push(`HCLTV ${scenario.hcltv_ratio.toFixed(2)}% exceeds max ${ip.max_cltv_ratio}%`);
   if (ip.max_dti_ratio != null && scenario.dti_ratio != null && scenario.dti_ratio > ip.max_dti_ratio)
     reasons.push(`DTI ${scenario.dti_ratio.toFixed(1)}% exceeds max ${ip.max_dti_ratio}%`);
   if (ip.state_exclusions?.length > 0 && ip.state_exclusions.includes(scenario.state_code))
@@ -286,6 +316,11 @@ function getDim1Value(dimType, s) {
     case "dti": return { value: s.dti_ratio || 0, label: `DTI ${(s.dti_ratio||0).toFixed(1)}%` };
     case "loan_amount": return { value: s.loan_amount, label: `Loan $${s.loan_amount.toLocaleString()}` };
     case "occupancy": return { value: s.occupancy, label: `Occupancy ${s.occupancy}` };
+    case "cltv": return { value: s.cltv_ratio, label: `CLTV ${s.cltv_ratio.toFixed(2)}%` };
+    case "hcltv": return { value: s.hcltv_ratio, label: `HCLTV ${s.hcltv_ratio.toFixed(2)}%` };
+    case "escrow_waiver": return { value: s.escrow_waiver || "none", label: `Escrow Waiver: ${s.escrow_waiver || "none"}` };
+    case "num_units": return { value: s.num_units || 1, label: `Units: ${s.num_units || 1}` };
+    case "purpose": return { value: s.purpose, label: `Purpose: ${s.purpose}` };
     default: return null;
   }
 }
@@ -1074,15 +1109,22 @@ function App() {
   const [form, setForm] = useState({
     loan_amount: 350000,
     property_value: 500000,
+    purchase_price: '',           // Purchase only — may differ from appraised value
+    appraised_value: '',          // Appraised value — if provided with purchase_price, LTV uses min()
     fico_score: 740,
     purpose: 'purchase',
     property_type: 'single_family',
     occupancy: 'primary_residence',
     state_code: 'NC',
+    county_name: '',              // County name (for conforming limits, AMI lookup)
+    zip_code: '',                 // Property ZIP code
     dti_ratio: '',
     num_units: '',
     preferred_lock_days: 45,      // Will be auto-set by getDefaultLockDays
     preferred_term_months: 360,
+    // Subordinate financing
+    subordinate_lien_balance: '',   // Total balance of all junior liens ($)
+    heloc_credit_limit: '',         // Full HELOC credit limit for HCLTV calc ($)
     // Scenario flags
     is_veteran: false,            // Veteran — required for VA product eligibility
     is_first_va_use: true,        // First time using VA benefit (only relevant if veteran)
@@ -1091,6 +1133,8 @@ function App() {
     self_employed: false,         // Self-employed borrower
     is_first_time_buyer: false,   // First-time homebuyer
     is_ami_below_80: false,       // Borrower income ≤80% AMI → FNMA LLPA waiver on conventional
+    is_ami_below_100: false,      // Borrower income ≤100% AMI → partial LLPA relief
+    escrow_waiver: 'none',        // 'none' | 'partial' | 'full'
     // Pricing display options
     origination_fee: 1500,        // Lender origination / UW fee ($)
     fees_in: false,               // false = fees-out (fees shown separately), true = fees baked into rate/price
@@ -1161,11 +1205,18 @@ function App() {
       ...form,
       loan_amount: Number(form.loan_amount),
       property_value: Number(form.property_value),
+      purchase_price: form.purchase_price ? Number(form.purchase_price) : undefined,
+      appraised_value: form.appraised_value ? Number(form.appraised_value) : undefined,
       fico_score: Number(form.fico_score),
       preferred_lock_days: Number(form.preferred_lock_days),
       preferred_term_months: Number(form.preferred_term_months),
       dti_ratio: form.dti_ratio ? Number(form.dti_ratio) : undefined,
       num_units: form.num_units ? Number(form.num_units) : undefined,
+      subordinate_lien_balance: form.subordinate_lien_balance ? Number(form.subordinate_lien_balance) : undefined,
+      heloc_credit_limit: form.heloc_credit_limit ? Number(form.heloc_credit_limit) : undefined,
+      county_name: form.county_name || undefined,
+      zip_code: form.zip_code || undefined,
+      escrow_waiver: form.escrow_waiver || 'none',
       is_first_va_use: form.is_first_va_use,
       is_va_funding_fee_exempt: form.is_va_funding_fee_exempt,
     };
@@ -1248,10 +1299,18 @@ function App() {
                 <input type="text" value={formatCurrency(form.loan_amount)} onChange={e => updateForm('loan_amount', parseCurrency(e.target.value))} />
               </div>
               <div className="form-group">
-                <label>Property Value</label>
+                <label>{form.purpose === 'purchase' ? 'Purchase Price' : 'Property Value'}</label>
                 <input type="text" value={formatCurrency(form.property_value)} onChange={e => updateForm('property_value', parseCurrency(e.target.value))} />
               </div>
             </div>
+            {form.purpose === 'purchase' && (
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Appraised Value <span style={{fontSize:10, color:'var(--text3)'}}>(if different)</span></label>
+                  <input type="text" value={form.appraised_value ? formatCurrency(form.appraised_value) : ''} onChange={e => updateForm('appraised_value', parseCurrency(e.target.value) || '')} placeholder="Same as purchase price" />
+                </div>
+              </div>
+            )}
             <div className="form-row">
               <div className="form-group">
                 <label>FICO Score</label>
@@ -1262,12 +1321,55 @@ function App() {
                 <input type="number" value={form.dti_ratio} onChange={e => updateForm('dti_ratio', e.target.value)} placeholder="e.g. 38" />
               </div>
             </div>
-            <div className="form-row">
-              <div className="form-group" style={{flex:2}}>
-                <label>LTV (calculated)</label>
-                <input readOnly value={form.loan_amount && form.property_value ? ((Number(form.loan_amount)/Number(form.property_value))*100).toFixed(2) + '%' : '--'} style={{color:'var(--accent)', fontWeight:600}} />
+            <div className="form-section" style={{margin:0, padding:'6px 0 0 0', border:'none'}}>
+              <h4 style={{fontSize:11, color:'var(--text3)', margin:'0 0 4px 0'}}>Subordinate Financing</h4>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Sub. Lien Balance ($)</label>
+                  <input type="text" value={form.subordinate_lien_balance ? formatCurrency(form.subordinate_lien_balance) : ''} onChange={e => updateForm('subordinate_lien_balance', parseCurrency(e.target.value) || '')} placeholder="0" />
+                </div>
+                <div className="form-group">
+                  <label>HELOC Credit Limit ($)</label>
+                  <input type="text" value={form.heloc_credit_limit ? formatCurrency(form.heloc_credit_limit) : ''} onChange={e => updateForm('heloc_credit_limit', parseCurrency(e.target.value) || '')} placeholder="0 (full line)" />
+                </div>
               </div>
             </div>
+            {(() => {
+              const pv = Number(form.property_value) || 0;
+              const la = Number(form.loan_amount) || 0;
+              const appr = Number(form.appraised_value) || 0;
+              const effPV = (form.purpose === 'purchase' && appr > 0) ? Math.min(pv, appr) : pv;
+              const subBal = Number(form.subordinate_lien_balance) || 0;
+              const helocLimit = Number(form.heloc_credit_limit) || 0;
+              const unfundedHeloc = Math.max(0, helocLimit - subBal);
+              const ltv = effPV > 0 ? Math.floor((la / effPV) * 10000) / 100 : 0;
+              const cltv = effPV > 0 ? Math.floor(((la + subBal) / effPV) * 10000) / 100 : 0;
+              const hcltv = effPV > 0 ? Math.floor(((la + subBal + unfundedHeloc) / effPV) * 10000) / 100 : 0;
+              const showCltv = subBal > 0 || helocLimit > 0;
+              return (
+                <div className="form-row" style={{marginTop:4}}>
+                  <div className="form-group" style={{flex: showCltv ? 1 : 2}}>
+                    <label>LTV</label>
+                    <input readOnly value={effPV > 0 ? ltv.toFixed(2) + '%' : '--'} style={{color:'var(--accent)', fontWeight:600}} />
+                    {form.purpose === 'purchase' && appr > 0 && appr !== pv && (
+                      <div style={{fontSize:9, color:'var(--text3)'}}>Using min(price, appraisal) = ${effPV.toLocaleString()}</div>
+                    )}
+                  </div>
+                  {showCltv && (
+                    <div className="form-group">
+                      <label>CLTV</label>
+                      <input readOnly value={cltv.toFixed(2) + '%'} style={{color:'var(--accent)', fontWeight:600}} />
+                    </div>
+                  )}
+                  {showCltv && helocLimit > 0 && (
+                    <div className="form-group">
+                      <label>HCLTV</label>
+                      <input readOnly value={hcltv.toFixed(2) + '%'} style={{color:'var(--accent)', fontWeight:600}} />
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           <div className="form-section">
@@ -1312,6 +1414,16 @@ function App() {
                 <label>State</label>
                 <input value={form.state_code} onChange={e => updateForm('state_code', e.target.value.toUpperCase())} maxLength={2} placeholder="NC" />
               </div>
+              <div className="form-group">
+                <label>County</label>
+                <input value={form.county_name} onChange={e => updateForm('county_name', e.target.value)} placeholder="e.g. Wake" />
+              </div>
+              <div className="form-group">
+                <label>ZIP</label>
+                <input value={form.zip_code} onChange={e => updateForm('zip_code', e.target.value)} maxLength={10} placeholder="27601" />
+              </div>
+            </div>
+            <div className="form-row">
               <div className="form-group">
                 <label>Units (if multi)</label>
                 <input type="number" value={form.num_units} onChange={e => updateForm('num_units', e.target.value)} placeholder="1" />
@@ -1400,15 +1512,31 @@ function App() {
             <div className="form-row">
               <div className="form-group">
                 <label style={{display:'flex', alignItems:'center', gap:6}}>
-                  <input type="checkbox" checked={form.is_ami_below_80} onChange={e => updateForm('is_ami_below_80', e.target.checked)} style={{width:'auto'}} />
-                  AMI &lt;80%
+                  <input type="checkbox" checked={form.is_ami_below_80} onChange={e => { updateForm('is_ami_below_80', e.target.checked); if(e.target.checked) updateForm('is_ami_below_100', true); }} style={{width:'auto'}} />
+                  AMI ≤80%
                 </label>
               </div>
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.is_ami_below_100} onChange={e => { updateForm('is_ami_below_100', e.target.checked); if(!e.target.checked) updateForm('is_ami_below_80', false); }} style={{width:'auto'}} />
+                  AMI ≤100%
+                </label>
+              </div>
+            </div>
+            <div className="form-row">
               <div className="form-group">
                 <label style={{display:'flex', alignItems:'center', gap:6}}>
                   <input type="checkbox" checked={form.is_veteran} onChange={e => updateForm('is_veteran', e.target.checked)} style={{width:'auto'}} />
                   Veteran
                 </label>
+              </div>
+              <div className="form-group">
+                <label>Escrow Waiver</label>
+                <select value={form.escrow_waiver} onChange={e => updateForm('escrow_waiver', e.target.value)} style={{fontSize:12}}>
+                  <option value="none">None (impounds)</option>
+                  <option value="partial">Partial waiver</option>
+                  <option value="full">Full waiver</option>
+                </select>
               </div>
             </div>
             <div className="form-row">
@@ -1423,12 +1551,12 @@ function App() {
             </div>
             <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
               {form.is_ami_below_80 ? 'AMI ≤80%: FNMA primary LLPA waiver on conventional (purchase/refi, primary res). ' : ''}
+              {form.is_ami_below_100 && !form.is_ami_below_80 ? 'AMI ≤100%: partial LLPA relief on conventional. ' : ''}
               {form.is_first_time_buyer ? 'First-time homebuyer flagged. ' : ''}
               {form.self_employed ? 'Self-employed: lock defaults to 45+ days. ' : ''}
               {form.is_veteran ? 'Veteran: VA products eligible. ' : ''}
               {form.subordination ? 'Subordination: lock defaults to 60 days. ' : ''}
-              {!form.self_employed && !form.subordination && !form.is_first_time_buyer && !form.is_ami_below_80 && !form.is_veteran
-                ? 'Check applicable flags. These affect eligibility, lock period, and LLPA calculations.' : ''}
+              {form.escrow_waiver !== 'none' ? `Escrow ${form.escrow_waiver} waiver: LLPA adjustment may apply. ` : ''}
             </div>
           </div>
 
