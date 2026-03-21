@@ -710,72 +710,225 @@ function getProductSortOrder(productCode, isVeteran) {
 // EXCEL DOWNLOAD
 // =============================================
 
+// CUMIPMT equivalent: cumulative interest paid from startPeriod to endPeriod (1-indexed)
+function cumipmt(annualRatePercent, totalPeriods, pv, startPeriod, endPeriod) {
+  const r = annualRatePercent / 100 / 12;
+  if (r <= 0 || totalPeriods <= 0 || pv <= 0) return 0;
+  const pmt = pv * r * Math.pow(1 + r, totalPeriods) / (Math.pow(1 + r, totalPeriods) - 1);
+  let balance = pv;
+  let totalInterest = 0;
+  for (let p = 1; p <= Math.min(endPeriod, totalPeriods); p++) {
+    const interest = balance * r;
+    const principal = pmt - interest;
+    if (p >= startPeriod) totalInterest += interest;
+    balance -= principal;
+  }
+  return totalInterest;
+}
+
 function downloadPricingExcel(response, eligibleGroups, form) {
   if (!window.XLSX) { alert('SheetJS library not loaded'); return; }
   const wb = XLSX.utils.book_new();
 
-  // --- Sheet 1: All Rate Options ---
-  const rows = [];
+  const tilYears = Number(form.time_in_loan_years) || 4.25;
+  const tilMonths = Math.round(tilYears * 12);
+  const threeYearMonths = 36;
+  const monthlyEscrow = Math.round((Number(form.property_value) || 0) * (Number(form.escrow_annual_rate) || 1.25) / 100 / 12);
+  const monthlyIncome = (Number(form.borrower_income) || 0) / 12;
+  const origFee = Number(form.origination_fee) || 1500;
+
+  // --- Build flat list with analysis columns ---
+  const allRows = [];
   for (const { group } of eligibleGroups) {
     for (const r of group) {
-      rows.push({
+      const rateP = r.pricing.base_rate_percent;
+      const termMo = r.term_months;
+      const totalLoan = r.pricing.total_loan_amount;
+      const finalPrice = r.pricing.final_price_points;
+      const monthlyMI = r.pricing.government_insurance?.monthly_amount || 0;
+      const upfrontFee = r.pricing.government_insurance?.upfront_fee_amount || 0;
+      const estClosing = r.pricing.estimated_closing_costs;
+
+      // AA: Cumulative interest over time-in-loan
+      const interest = cumipmt(rateP, termMo, totalLoan, 1, tilMonths);
+      // AB: PMI/MIP cost over time-in-loan (capped at MI duration if shorter)
+      const miDurationMo = r.pricing.government_insurance?.duration_months || tilMonths;
+      const miMonths = Math.min(tilMonths, miDurationMo);
+      const pmiCost = monthlyMI * miMonths;
+      // AC: Points/Credits — positive = borrower pays, negative = lender credit
+      const pointsCredits = ((100 - finalPrice) / 100) * totalLoan;
+      // AD: Underwriting fee
+      const uwFee = origFee;
+      // AE: Upfront MIP / Funding Fees
+      const upfrontMipFf = upfrontFee;
+      // AF: Other closing costs
+      const otherClosing = estClosing;
+      // AG: Total Upfront Costs
+      const totalUpfront = pointsCredits + uwFee + upfrontMipFf + otherClosing;
+      // AH: Total Cost Over Time in Loan
+      const totalCostTIL = interest + pmiCost + totalUpfront;
+      // AO: 3-Year Costs (upfront + 36mo interest + 36mo MI)
+      const interest3yr = cumipmt(rateP, termMo, totalLoan, 1, threeYearMonths);
+      const mi3yr = monthlyMI * Math.min(threeYearMonths, miDurationMo);
+      const cost3yr = totalUpfront + interest3yr + mi3yr;
+      // AR: Monthly Escrow
+      // AS: DTI
+      const dti = monthlyIncome > 0 ? (r.pricing.total_monthly_payment + monthlyEscrow) / monthlyIncome : 0;
+
+      allRows.push({
+        _product_code: r.product_code,
+        _product_category: r.product_category,
+        _result: r,
+        // Columns A-X (PPE output)
         'Investor': r.investor_code,
         'Product': r.product_code,
         'Category': r.product_category,
-        'Term (mo)': r.term_months,
-        'Rate %': r.pricing.base_rate_percent,
+        'Term (mo)': termMo,
+        'Rate %': rateP,
         'Base Price': r.pricing.base_price_points,
         'Total LLPA': r.pricing.total_llpa_points,
         'Comp $': r.pricing.comp_dollars,
         'Comp Pts': r.pricing.comp_points,
-        'Final Price': r.pricing.final_price_points,
+        'Final Price': finalPrice,
         'Final Rate %': r.pricing.final_rate_percent,
         'APR %': r.pricing.apr,
         'Monthly P&I': r.pricing.monthly_pi,
-        'Monthly MI': r.pricing.government_insurance?.monthly_amount || 0,
+        'Monthly MI': monthlyMI,
         'Total Monthly': r.pricing.total_monthly_payment,
-        'Total Loan Amt': r.pricing.total_loan_amount,
-        'Est. Closing': r.pricing.estimated_closing_costs,
+        'Total Loan Amt': totalLoan,
+        'Est. Closing': estClosing,
         'GI Type': r.pricing.government_insurance?.type || 'none',
         'Upfront Fee %': r.pricing.government_insurance?.upfront_fee_percent || 0,
-        'Upfront Fee $': r.pricing.government_insurance?.upfront_fee_amount || 0,
+        'Upfront Fee $': upfrontFee,
         'Par Rate': r.is_par_rate ? 'YES' : '',
         'Rate Option': r.rate_option,
         'Global Rank': r.rank,
         'Product Rank': r.product_rank,
+        // Spacer
+        '': '',
+        // Columns AA-AS (analysis)
+        'Interest': Math.round(interest * 100) / 100,
+        'PMI/MIP': Math.round(pmiCost * 100) / 100,
+        'Points/Credits': Math.round(pointsCredits * 100) / 100,
+        'Underwriting Fee': uwFee,
+        'Upfront MIP/Funding Fees': Math.round(upfrontMipFf * 100) / 100,
+        'Other Closing Costs': otherClosing,
+        'Total Upfront Costs': Math.round(totalUpfront * 100) / 100,
+        'Total Cost Over TIL': Math.round(totalCostTIL * 100) / 100,
+        'Rank (Total Cost)': 0,           // placeholder — filled below
+        'Best of Product': '',             // placeholder — filled below
+        'Lowest APR': '',                  // placeholder — filled below
+        'Highest APR': '',                 // placeholder — filled below
+        'No Cost Rank': 0,                 // placeholder — filled below
+        'No Cost Loan Option': '',         // placeholder — filled below
+        '3-Year Costs': Math.round(cost3yr * 100) / 100,
+        'Rank 3-Year': 0,                 // placeholder — filled below
+        '3-Year Winner': '',               // placeholder — filled below
+        'Monthly Escrow': monthlyEscrow,
+        'DTI': Math.round(dti * 10000) / 10000,
       });
     }
   }
-  if (rows.length > 0) {
-    const ws = XLSX.utils.json_to_sheet(rows);
-    // Auto-width columns
-    ws['!cols'] = Object.keys(rows[0]).map(k => ({ wch: Math.max(k.length, 12) }));
-    XLSX.utils.book_append_sheet(wb, ws, 'All Rate Options');
+
+  // --- Compute rankings per product code ---
+  const byCode = new Map();
+  for (const row of allRows) {
+    const code = row._product_code;
+    if (!byCode.has(code)) byCode.set(code, []);
+    byCode.get(code).push(row);
   }
+
+  for (const [code, group] of byCode) {
+    // Total cost rank within product code
+    const sorted = [...group].sort((a, b) => a['Total Cost Over TIL'] - b['Total Cost Over TIL']);
+    sorted.forEach((row, i) => { row['Rank (Total Cost)'] = i + 1; });
+
+    // No Cost Rank (by abs(Total Upfront) — closest to $0 = rank 1)
+    const noCostSorted = [...group].sort((a, b) => Math.abs(a['Total Upfront Costs']) - Math.abs(b['Total Upfront Costs']));
+    noCostSorted.forEach((row, i) => { row['No Cost Rank'] = i + 1; });
+
+    // No Cost Loan Option flag
+    for (const row of group) {
+      const absUp = Math.abs(row['Total Upfront Costs']);
+      if (absUp <= Math.abs(0.0015 * row['Total Loan Amt']) && absUp < 1000) {
+        row['No Cost Loan Option'] = 'No Cost Option';
+      }
+    }
+
+    // 3-Year rank within product code
+    const sorted3 = [...group].sort((a, b) => a['3-Year Costs'] - b['3-Year Costs']);
+    sorted3.forEach((row, i) => { row['Rank 3-Year'] = i + 1; });
+    if (sorted3.length > 0) sorted3[0]['3-Year Winner'] = '3-Year Winner';
+
+    // Lowest / Highest APR within product code
+    const sortedAPR = [...group].sort((a, b) => a['APR %'] - b['APR %']);
+    if (sortedAPR.length > 0) {
+      sortedAPR[0]['Lowest APR'] = 'Lowest APR';
+      sortedAPR[sortedAPR.length - 1]['Highest APR'] = 'Highest APR';
+    }
+  }
+
+  // --- Best of Product per category (lowest total cost in category) ---
+  const byCategory = new Map();
+  for (const row of allRows) {
+    const cat = row._product_category;
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat).push(row);
+  }
+  for (const [cat, group] of byCategory) {
+    const bestRank = Math.min(...group.map(r => r['Rank (Total Cost)']));
+    // Among all rows in this category that have rank 1 within their product code, find the one with lowest total cost
+    let bestRow = null;
+    let bestCost = Infinity;
+    for (const row of group) {
+      if (row['Total Cost Over TIL'] < bestCost) {
+        bestCost = row['Total Cost Over TIL'];
+        bestRow = row;
+      }
+    }
+    if (bestRow) {
+      const catLabel = cat === 'conventional' ? 'Best Conventional' : cat === 'fha' ? 'Best FHA' : cat === 'va' ? 'Best VA' : `Best ${cat}`;
+      bestRow['Best of Product'] = catLabel;
+    }
+  }
+
+  // --- Build Sheet 1: All Rate Options ---
+  const exportCols = [
+    'Investor','Product','Category','Term (mo)','Rate %','Base Price','Total LLPA',
+    'Comp $','Comp Pts','Final Price','Final Rate %','APR %','Monthly P&I','Monthly MI',
+    'Total Monthly','Total Loan Amt','Est. Closing','GI Type','Upfront Fee %','Upfront Fee $',
+    'Par Rate','Rate Option','Global Rank','Product Rank',
+    '', // spacer column
+    'Interest','PMI/MIP','Points/Credits','Underwriting Fee','Upfront MIP/Funding Fees',
+    'Other Closing Costs','Total Upfront Costs','Total Cost Over TIL',
+    'Rank (Total Cost)','Best of Product','Lowest APR','Highest APR',
+    'No Cost Rank','No Cost Loan Option','3-Year Costs','Rank 3-Year','3-Year Winner',
+    'Monthly Escrow','DTI',
+  ];
+
+  const sheetData = [exportCols];
+  for (const row of allRows) {
+    sheetData.push(exportCols.map(col => col === '' ? '' : row[col]));
+  }
+  const ws = XLSX.utils.aoa_to_sheet(sheetData);
+  ws['!cols'] = exportCols.map(k => ({ wch: k === '' ? 2 : Math.max(k.length + 2, 12) }));
+  XLSX.utils.book_append_sheet(wb, ws, 'All Rate Options');
 
   // --- Sheet 2: Par Rates Summary ---
   const parRows = [];
   for (const { group } of eligibleGroups) {
     const par = group.find(r => r.is_par_rate);
     if (par) {
-      parRows.push({
-        'Investor': par.investor_code,
-        'Product': par.product_code,
-        'Category': par.product_category,
-        'Rate %': par.pricing.base_rate_percent,
-        'Final Price': par.pricing.final_price_points,
-        'APR %': par.pricing.apr,
-        'Monthly P&I': par.pricing.monthly_pi,
-        'Monthly MI': par.pricing.government_insurance?.monthly_amount || 0,
-        'Total Monthly': par.pricing.total_monthly_payment,
-        'Total Loan Amt': par.pricing.total_loan_amount,
-        'Total LLPA': par.pricing.total_llpa_points,
-      });
+      const match = allRows.find(ar => ar._result === par);
+      if (match) parRows.push(match);
     }
   }
   if (parRows.length > 0) {
-    const ws2 = XLSX.utils.json_to_sheet(parRows);
-    ws2['!cols'] = Object.keys(parRows[0]).map(k => ({ wch: Math.max(k.length, 12) }));
+    const parCols = ['Investor','Product','Category','Rate %','Final Price','APR %','Monthly P&I','Monthly MI','Total Monthly','Total Loan Amt','Total LLPA','Total Cost Over TIL','Rank (Total Cost)','3-Year Costs'];
+    const parData = [parCols];
+    for (const row of parRows) { parData.push(parCols.map(c => row[c])); }
+    const ws2 = XLSX.utils.aoa_to_sheet(parData);
+    ws2['!cols'] = parCols.map(k => ({ wch: Math.max(k.length + 2, 12) }));
     XLSX.utils.book_append_sheet(wb, ws2, 'Par Rates');
   }
 
@@ -810,19 +963,25 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     { 'Field': 'Occupancy', 'Value': form.occupancy },
     { 'Field': 'State', 'Value': form.state_code },
     { 'Field': 'County', 'Value': form.county_name || '' },
+    { 'Field': 'Borrower Income', 'Value': form.borrower_income || '' },
     { 'Field': 'DTI %', 'Value': form.dti_ratio || '' },
     { 'Field': 'Veteran', 'Value': form.is_veteran ? 'Yes' : 'No' },
+    { 'Field': 'First-Time Buyer', 'Value': form.is_first_time_buyer ? 'Yes' : 'No' },
     { 'Field': 'Escrow Waiver', 'Value': form.escrow_waiver },
     { 'Field': 'Sub Lien Balance', 'Value': form.subordinate_lien_balance || 0 },
     { 'Field': 'HELOC Limit', 'Value': form.heloc_credit_limit || 0 },
     { 'Field': 'Origination Fee', 'Value': form.origination_fee },
     { 'Field': 'Fees In', 'Value': form.fees_in ? 'Yes' : 'No' },
     { 'Field': 'Escrow Annual Rate %', 'Value': form.escrow_annual_rate },
+    { 'Field': 'Time in Loan (years)', 'Value': tilYears },
+    { 'Field': 'Time in Loan (months)', 'Value': tilMonths },
+    { 'Field': 'Monthly Escrow', 'Value': monthlyEscrow },
+    { 'Field': 'Excluded Products', 'Value': form.excluded_products },
     { 'Field': 'Products Eligible', 'Value': response.meta.products_eligible },
     { 'Field': 'Execution Time (ms)', 'Value': response.meta.execution_ms },
   ];
   const ws4 = XLSX.utils.json_to_sheet(scenarioRows);
-  ws4['!cols'] = [{ wch: 22 }, { wch: 30 }];
+  ws4['!cols'] = [{ wch: 24 }, { wch: 30 }];
   XLSX.utils.book_append_sheet(wb, ws4, 'Scenario');
 
   // --- Sheet 5: Ineligible Products ---
@@ -1341,6 +1500,9 @@ function App() {
     origination_fee: 1500,        // Lender origination / UW fee ($)
     fees_in: false,               // false = fees-out (fees shown separately), true = fees baked into rate/price
     escrow_annual_rate: 1.25,     // Annual escrow estimate as % of property value (taxes + insurance)
+    // Analysis options
+    time_in_loan_years: 4.25,     // Expected hold period (years) — drives total cost analysis
+    excluded_products: 'FHA30_203K', // Comma-separated product codes to hide from results & downloads
   });
 
   const updateForm = (field, value) => setForm(prev => ({...prev, [field]: value}));
@@ -1448,12 +1610,18 @@ function App() {
     setLoading(false);
   }, [form]);
 
-  // Group results by product
+  // Parse excluded products
+  const excludedSet = new Set(
+    (form.excluded_products || '').split(',').map(s => s.trim()).filter(Boolean)
+  );
+
+  // Group results by product (filtering exclusions)
   const eligibleGroups = [];
   const ineligibleResults = [];
   if (response?.results) {
     const gmap = new Map();
     for (const r of response.results) {
+      if (excludedSet.has(r.product_code)) continue; // skip excluded products
       if (r.eligibility.is_eligible && r.pricing) {
         const k = `${r.investor_code}::${r.product_code}`;
         if (!gmap.has(k)) gmap.set(k, []);
@@ -1712,6 +1880,28 @@ function App() {
                 </label>
                 <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
                   {form.fees_in ? 'Origination fee baked into rate/price. No separate fee line.' : 'Origination fee shown as separate lender cost.'}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="form-section">
+            <h3>Analysis Settings</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Time in Loan (years)</label>
+                <input type="number" step="0.25" value={form.time_in_loan_years} onChange={e => updateForm('time_in_loan_years', e.target.value)} />
+                <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
+                  Drives total cost & 3-year analysis in Excel download.
+                </div>
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Exclude Products (comma-separated)</label>
+                <input value={form.excluded_products} onChange={e => updateForm('excluded_products', e.target.value)} placeholder="e.g. FHA30_203K, FHA30_HB" />
+                <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
+                  Products listed here are hidden from results and Excel downloads.
                 </div>
               </div>
             </div>
