@@ -1112,24 +1112,18 @@ async function runPricing(client, scenario) {
         const isNQM = (product.category || '').toLowerCase().startsWith('nqm') || (product.code || '').toUpperCase().startsWith('NQM');
         const effectiveLockDays = isNQM ? Math.max(scenario.lock_days, 45) : scenario.lock_days;
 
-        // Find base rates
+        // Find base rates — use product's own term, not a scenario filter
         let rates = allBaseRates
-          .filter(r => r.product_id === product.id && r.term_months === scenario.term_months && r.lock_period_days === effectiveLockDays)
+          .filter(r => r.product_id === product.id && r.term_months === product.term_months && r.lock_period_days === effectiveLockDays)
           .sort((a, b) => a.rate_percent - b.rate_percent);
 
-        if (!rates.length && scenario.term_months !== product.term_months) {
-          rates = allBaseRates
-            .filter(r => r.product_id === product.id && r.term_months === product.term_months && r.lock_period_days === effectiveLockDays)
-            .sort((a, b) => a.rate_percent - b.rate_percent);
-        }
-
         if (!rates.length) {
-          if (elig.is_eligible) errors.push(`No base rate: ${product.code} @ ${scenario.term_months}mo/${effectiveLockDays}d`);
+          if (elig.is_eligible) errors.push(`No base rate: ${product.code} @ ${product.term_months}mo/${effectiveLockDays}d`);
           if (!elig.is_eligible) {
             results.push({
               rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name,
               product_code: product.code, product_name: product.name, product_category: product.category,
-              term_months: scenario.term_months, rate_sheet_date: sheets[0].effective_date,
+              term_months: product.term_months, rate_sheet_date: sheets[0].effective_date,
               rate_option: "below_par", is_par_rate: false,
               eligibility: elig, pricing: null, llpa_breakdown: [],
             });
@@ -1632,7 +1626,7 @@ function App() {
       preferred_lock_days: Number(form.preferred_lock_days),
       preferred_term_months: Number(form.preferred_term_months),
       dti_ratio: undefined, // DTI is now computed from outputs, not an input. Eligibility knockouts will skip if undefined.
-      num_units: form.num_units ? Number(form.num_units) : undefined,
+      num_units: form.property_type === 'multi_unit_2' ? 2 : form.property_type === 'multi_unit_3' ? 3 : form.property_type === 'multi_unit_4' ? 4 : 1,
       subordinate_lien_balance: form.subordinate_lien_balance ? Number(form.subordinate_lien_balance) : undefined,
       heloc_credit_limit: form.heloc_credit_limit ? Number(form.heloc_credit_limit) : undefined,
       county_name: form.county_name || undefined,
@@ -1729,16 +1723,33 @@ function App() {
 
       <div className="main">
         <div className="panel-left">
+          {/* === 1. LOAN PURPOSE === */}
+          <div className="form-section">
+            <h3>Loan Purpose</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <select value={form.purpose} onChange={e => updateForm('purpose', e.target.value)}>
+                  <option value="purchase">Purchase</option>
+                  <option value="rate_term_refi">Rate/Term Refi</option>
+                  <option value="cash_out_refi">Cash-Out Refi</option>
+                  <option value="heloc">HELOC</option>
+                  <option value="heloan">HELOAN</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {/* === 2. LOAN AMOUNT / VALUE / LTV === */}
           <div className="form-section">
             <h3>Loan Details</h3>
             <div className="form-row">
               <div className="form-group">
-                <label>Loan Amount</label>
-                <input type="text" value={formatCurrency(form.loan_amount)} onChange={e => updateForm('loan_amount', parseCurrency(e.target.value))} />
-              </div>
-              <div className="form-group">
                 <label>{form.purpose === 'purchase' ? 'Purchase Price' : 'Property Value'}</label>
                 <input type="text" value={formatCurrency(form.property_value)} onChange={e => updateForm('property_value', parseCurrency(e.target.value))} />
+              </div>
+              <div className="form-group">
+                <label>Loan Amount</label>
+                <input type="text" value={formatCurrency(form.loan_amount)} onChange={e => updateForm('loan_amount', parseCurrency(e.target.value))} />
               </div>
             </div>
             {form.purpose === 'purchase' && (
@@ -1749,78 +1760,52 @@ function App() {
                 </div>
               </div>
             )}
-            <div className="form-row">
-              <div className="form-group">
-                <label>FICO Score</label>
-                <input type="number" value={form.fico_score} onChange={e => updateForm('fico_score', e.target.value)} />
-              </div>
-            </div>
-            <div className="form-section" style={{margin:0, padding:'6px 0 0 0', border:'none'}}>
-              <h4 style={{fontSize:11, color:'var(--text3)', margin:'0 0 4px 0'}}>Subordinate Financing</h4>
-              <div className="form-row">
-                <div className="form-group">
-                  <label>Sub. Lien Balance ($)</label>
-                  <input type="text" value={form.subordinate_lien_balance ? formatCurrency(form.subordinate_lien_balance) : ''} onChange={e => updateForm('subordinate_lien_balance', parseCurrency(e.target.value) || '')} placeholder="0" />
-                </div>
-                <div className="form-group">
-                  <label>HELOC Credit Limit ($)</label>
-                  <input type="text" value={form.heloc_credit_limit ? formatCurrency(form.heloc_credit_limit) : ''} onChange={e => updateForm('heloc_credit_limit', parseCurrency(e.target.value) || '')} placeholder="0 (full line)" />
-                </div>
-              </div>
-            </div>
+            {/* LTV — editable: changing it adjusts loan amount */}
             {(() => {
               const pv = Number(form.property_value) || 0;
               const la = Number(form.loan_amount) || 0;
               const appr = Number(form.appraised_value) || 0;
               const effPV = (form.purpose === 'purchase' && appr > 0) ? Math.min(pv, appr) : pv;
-              const subBal = Number(form.subordinate_lien_balance) || 0;
-              const helocLimit = Number(form.heloc_credit_limit) || 0;
-              const unfundedHeloc = Math.max(0, helocLimit - subBal);
               const ltv = effPV > 0 ? Math.floor((la / effPV) * 10000) / 100 : 0;
-              const cltv = effPV > 0 ? Math.floor(((la + subBal) / effPV) * 10000) / 100 : 0;
-              const hcltv = effPV > 0 ? Math.floor(((la + subBal + unfundedHeloc) / effPV) * 10000) / 100 : 0;
-              const showCltv = subBal > 0 || helocLimit > 0;
+              const handleLtvChange = (e) => {
+                const newLtv = parseFloat(e.target.value);
+                if (!isNaN(newLtv) && newLtv > 0 && newLtv <= 100 && effPV > 0) {
+                  const newLoan = Math.round(effPV * newLtv / 100);
+                  updateForm('loan_amount', newLoan);
+                }
+              };
               return (
-                <div className="form-row" style={{marginTop:4}}>
-                  <div className="form-group" style={{flex: showCltv ? 1 : 2}}>
-                    <label>LTV</label>
-                    <input readOnly value={effPV > 0 ? ltv.toFixed(2) + '%' : '--'} style={{color:'var(--accent)', fontWeight:600}} />
+                <div className="form-row" style={{marginTop:2}}>
+                  <div className="form-group">
+                    <label>LTV %</label>
+                    <input
+                      type="number" step="0.01" min="0" max="100"
+                      value={effPV > 0 ? ltv.toFixed(2) : ''}
+                      onChange={handleLtvChange}
+                      style={{color:'var(--accent)', fontWeight:600}}
+                      placeholder="--"
+                    />
                     {form.purpose === 'purchase' && appr > 0 && appr !== pv && (
                       <div style={{fontSize:9, color:'var(--text3)'}}>Using min(price, appraisal) = ${effPV.toLocaleString()}</div>
                     )}
                   </div>
-                  {showCltv && (
-                    <div className="form-group">
-                      <label>CLTV</label>
-                      <input readOnly value={cltv.toFixed(2) + '%'} style={{color:'var(--accent)', fontWeight:600}} />
-                    </div>
-                  )}
-                  {showCltv && helocLimit > 0 && (
-                    <div className="form-group">
-                      <label>HCLTV</label>
-                      <input readOnly value={hcltv.toFixed(2) + '%'} style={{color:'var(--accent)', fontWeight:600}} />
-                    </div>
-                  )}
                 </div>
               );
             })()}
           </div>
 
+          {/* === 3. PROPERTY INFORMATION === */}
           <div className="form-section">
-            <h3>Loan Purpose & Property</h3>
+            <h3>Property</h3>
             <div className="form-row">
               <div className="form-group">
-                <label>Purpose</label>
-                <select value={form.purpose} onChange={e => updateForm('purpose', e.target.value)}>
-                  <option value="purchase">Purchase</option>
-                  <option value="rate_term_refi">Rate/Term Refi</option>
-                  <option value="cash_out_refi">Cash-Out Refi</option>
-                  <option value="heloc">HELOC</option>
-                  <option value="heloan">HELOAN</option>
+                <label>Occupancy</label>
+                <select value={form.occupancy} onChange={e => updateForm('occupancy', e.target.value)}>
+                  <option value="primary_residence">Primary</option>
+                  <option value="secondary_residence">Second Home</option>
+                  <option value="investment_property">Investment</option>
                 </select>
               </div>
-            </div>
-            <div className="form-row">
               <div className="form-group">
                 <label>Property Type</label>
                 <select value={form.property_type} onChange={e => updateForm('property_type', e.target.value)}>
@@ -1832,14 +1817,6 @@ function App() {
                   <option value="multi_unit_4">4-Unit</option>
                   <option value="manufactured_home">Manufactured</option>
                   <option value="pud">PUD</option>
-                </select>
-              </div>
-              <div className="form-group">
-                <label>Occupancy</label>
-                <select value={form.occupancy} onChange={e => updateForm('occupancy', e.target.value)}>
-                  <option value="primary_residence">Primary</option>
-                  <option value="secondary_residence">Second Home</option>
-                  <option value="investment_property">Investment</option>
                 </select>
               </div>
             </div>
@@ -1857,21 +1834,33 @@ function App() {
                   ))}
                 </select>
               </div>
-              <div className="form-group">
-                <label>ZIP</label>
-                <input value={form.zip_code} onChange={e => updateForm('zip_code', e.target.value)} maxLength={10} placeholder="27601" />
-              </div>
             </div>
+          </div>
+
+          {/* === 4. FICO === */}
+          <div className="form-section">
+            <h3>Borrower</h3>
             <div className="form-row">
               <div className="form-group">
-                <label>Units (if multi)</label>
-                <input type="number" value={form.num_units} onChange={e => updateForm('num_units', e.target.value)} placeholder="1" />
+                <label>FICO Score</label>
+                <input type="number" value={form.fico_score} onChange={e => updateForm('fico_score', e.target.value)} />
               </div>
             </div>
           </div>
 
+          {/* === 5. PRICING DISPLAY === */}
           <div className="form-section">
-            <h3>Rate Options</h3>
+            <h3>Pricing Display</h3>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Origination Fee ($)</label>
+                <input type="text" value={formatCurrency(form.origination_fee)} onChange={e => updateForm('origination_fee', parseCurrency(e.target.value))} />
+              </div>
+              <div className="form-group">
+                <label>Escrow Rate (% of value)</label>
+                <input type="number" step="0.25" value={form.escrow_annual_rate} onChange={e => updateForm('escrow_annual_rate', e.target.value)} />
+              </div>
+            </div>
             <div className="form-row">
               <div className="form-group">
                 <label>Lock Period (days)</label>
@@ -1895,72 +1884,20 @@ function App() {
                 })()}
               </div>
               <div className="form-group">
-                <label>Term</label>
-                <select value={form.preferred_term_months} onChange={e => updateForm('preferred_term_months', e.target.value)}>
-                  <option value={360}>30-year</option>
-                  <option value={300}>25-year</option>
-                  <option value={240}>20-year</option>
-                  <option value={180}>15-year</option>
-                  <option value={120}>10-year</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <div className="form-section">
-            <h3>Pricing Display</h3>
-            <div className="form-row">
-              <div className="form-group">
-                <label>Origination Fee ($)</label>
-                <input type="text" value={formatCurrency(form.origination_fee)} onChange={e => updateForm('origination_fee', parseCurrency(e.target.value))} />
-              </div>
-              <div className="form-group">
-                <label>Escrow Rate (% of value)</label>
-                <input type="number" step="0.25" value={form.escrow_annual_rate} onChange={e => updateForm('escrow_annual_rate', e.target.value)} />
-              </div>
-            </div>
-            <div className="form-row">
-              <div className="form-group">
                 <label style={{display:'flex', alignItems:'center', gap:6}}>
                   <input type="checkbox" checked={form.fees_in} onChange={e => updateForm('fees_in', e.target.checked)} style={{width:'auto'}} />
                   Fees-In Pricing
                 </label>
                 <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
-                  {form.fees_in ? 'Origination fee baked into rate/price. No separate fee line.' : 'Origination fee shown as separate lender cost.'}
+                  {form.fees_in ? 'Fees baked into rate.' : 'Fees shown separately.'}
                 </div>
               </div>
             </div>
           </div>
 
+          {/* === 6. INCOME & DEBT SERVICE === */}
           <div className="form-section">
-            <h3>Analysis Settings</h3>
-            <div className="form-row">
-              <div className="form-group">
-                <label>Exclude Products (comma-separated)</label>
-                <input value={form.excluded_products} onChange={e => updateForm('excluded_products', e.target.value)} placeholder="e.g. FHA30_203K, FHA30_HB" />
-                <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
-                  Products listed here are hidden from results and Excel downloads.
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="form-section">
-            <h3>Scenario Flags</h3>
-            <div className="form-row">
-              <div className="form-group">
-                <label style={{display:'flex', alignItems:'center', gap:6}}>
-                  <input type="checkbox" checked={form.self_employed} onChange={e => updateForm('self_employed', e.target.checked)} style={{width:'auto'}} />
-                  Self-Employed
-                </label>
-              </div>
-              <div className="form-group">
-                <label style={{display:'flex', alignItems:'center', gap:6}}>
-                  <input type="checkbox" checked={form.is_first_time_buyer} onChange={e => updateForm('is_first_time_buyer', e.target.checked)} style={{width:'auto'}} />
-                  First-Time Homebuyer
-                </label>
-              </div>
-            </div>
+            <h3>Income & Debt</h3>
             {(() => {
               const amiInfo = lookupAMI(form.state_code, form.county_name);
               const income = Number(form.borrower_income) || 0;
@@ -1977,73 +1914,56 @@ function App() {
                     <div className="form-group">
                       <label>Additional Debt Service ($/mo)</label>
                       <input type="text" value={formatCurrency(form.additional_debt_service)} onChange={e => updateForm('additional_debt_service', parseCurrency(e.target.value))} placeholder="$250" />
-                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Car, student loans, credit cards, etc.</div>
+                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Car, student loans, cards, etc.</div>
                     </div>
                   </div>
-                  <div className="form-row">
-                    <div className="form-group">
-                      {amiInfo ? (
-                        <div style={{fontSize:10, marginTop:16}}>
-                          <div style={{color:'var(--text3)'}}>County AMI: <strong>${amiInfo.ami_100.toLocaleString()}</strong></div>
-                          <div style={{color:'var(--text3)'}}>80% AMI: <strong>${amiInfo.ami_80.toLocaleString()}</strong></div>
-                          {hasIncome && (
-                            <div style={{marginTop:2, fontWeight:600, color: isBelow80 ? 'var(--green)' : isBelow100 ? '#d4a017' : 'var(--text3)'}}>
-                              {isBelow80 ? '✓ AMI ≤80% (LLPA waiver)' : isBelow100 ? '✓ AMI ≤100%' : 'Above 100% AMI'}
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        <div style={{fontSize:10, color:'var(--text3)', marginTop:16}}>
-                          {form.state_code && form.county_name ? 'County not found' : 'Select state & county for AMI lookup'}
-                        </div>
-                      )}
+                  {amiInfo && hasIncome && (
+                    <div style={{fontSize:10, marginTop:2, fontWeight:600, color: isBelow80 ? 'var(--green)' : isBelow100 ? '#d4a017' : 'var(--text3)'}}>
+                      {isBelow80 ? '✓ AMI ≤80% — FNMA LLPA waiver applies' : isBelow100 ? '✓ AMI ≤100%' : `Above 100% AMI ($${amiInfo.ami_100.toLocaleString()})`}
                     </div>
-                  </div>
-                  {/* Hidden — auto-set from income/AMI lookup, still in form for engine */}
+                  )}
                   <input type="hidden" value={isBelow80} />
                   <input type="hidden" value={isBelow100} />
                 </div>
               );
             })()}
+          </div>
+
+          {/* === 7. SCENARIO FLAGS === */}
+          <div className="form-section">
+            <h3>Scenario Flags</h3>
             <div className="form-row">
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.is_first_time_buyer} onChange={e => updateForm('is_first_time_buyer', e.target.checked)} style={{width:'auto'}} />
+                  First-Time Homebuyer
+                </label>
+              </div>
               <div className="form-group">
                 <label style={{display:'flex', alignItems:'center', gap:6}}>
                   <input type="checkbox" checked={form.is_veteran} onChange={e => updateForm('is_veteran', e.target.checked)} style={{width:'auto'}} />
                   Veteran
                 </label>
               </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label style={{display:'flex', alignItems:'center', gap:6}}>
+                  <input type="checkbox" checked={form.self_employed} onChange={e => updateForm('self_employed', e.target.checked)} style={{width:'auto'}} />
+                  Self-Employed
+                </label>
+              </div>
               <div className="form-group">
                 <label>Escrow Waiver</label>
                 <select value={form.escrow_waiver} onChange={e => updateForm('escrow_waiver', e.target.value)} style={{fontSize:12}}>
-                  <option value="none">None (impounds)</option>
-                  <option value="partial">Partial waiver</option>
-                  <option value="full">Full waiver</option>
+                  <option value="none">None</option>
+                  <option value="partial">Partial</option>
+                  <option value="full">Full</option>
                 </select>
               </div>
             </div>
-            <div className="form-row">
-              {(form.purpose === 'rate_term_refi' || form.purpose === 'cash_out_refi') && (
-                <div className="form-group">
-                  <label style={{display:'flex', alignItems:'center', gap:6}}>
-                    <input type="checkbox" checked={form.subordination} onChange={e => updateForm('subordination', e.target.checked)} style={{width:'auto'}} />
-                    Subordination
-                  </label>
-                </div>
-              )}
-            </div>
-            <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
-              {form.is_first_time_buyer ? 'First-time homebuyer flagged. ' : ''}
-              {form.self_employed ? 'Self-employed: lock defaults to 45+ days. ' : ''}
-              {form.is_veteran ? 'Veteran: VA products eligible. ' : ''}
-              {form.subordination ? 'Subordination: lock defaults to 60 days. ' : ''}
-              {form.escrow_waiver !== 'none' ? `Escrow ${form.escrow_waiver} waiver: LLPA adjustment may apply. ` : ''}
-            </div>
-          </div>
-
-          {form.is_veteran && (
-            <div className="form-section">
-              <h3>VA Options</h3>
-              <div className="form-row">
+            {form.is_veteran && (
+              <div className="form-row" style={{marginTop:4}}>
                 <div className="form-group">
                   <label style={{display:'flex', alignItems:'center', gap:6}}>
                     <input type="checkbox" checked={form.is_first_va_use} onChange={e => updateForm('is_first_va_use', e.target.checked)} style={{width:'auto'}} />
@@ -2057,13 +1977,16 @@ function App() {
                   </label>
                 </div>
               </div>
-              <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
-                First VA Use: lower funding fee for first-time benefit users. Exempt: disability, surviving spouse, Purple Heart.
-              </div>
+            )}
+            <div style={{fontSize:10, color:'var(--text3)', marginTop:4}}>
+              {form.is_first_time_buyer ? 'FTHB flagged. ' : ''}
+              {form.self_employed ? 'Self-employed: lock 45+d. ' : ''}
+              {form.is_veteran ? 'VA eligible. ' : ''}
+              {form.escrow_waiver !== 'none' ? `Escrow ${form.escrow_waiver} waiver. ` : ''}
             </div>
-          )}
+          </div>
 
-          {/* Time in Loan — auto-calculated, overridable */}
+          {/* === 8. TIME IN LOAN === */}
           {(() => {
             const autoTIL = getAutoTimeInLoan(form);
             const effTIL = getEffectiveTimeInLoan(form);
@@ -2076,7 +1999,7 @@ function App() {
               'heloan': 'HELOAN',
             };
             return (
-              <div className="form-section" style={{background:'var(--bg)', borderRadius:6, padding:10, marginTop:8}}>
+              <div className="form-section" style={{background:'var(--bg)', borderRadius:6, padding:10}}>
                 <div style={{display:'flex', alignItems:'center', gap:10}}>
                   <div style={{flex:1}}>
                     <div style={{fontSize:11, color:'var(--text3)', textTransform:'uppercase', letterSpacing:'0.05em', marginBottom:4}}>Time in Loan</div>
@@ -2102,6 +2025,90 @@ function App() {
               </div>
             );
           })()}
+
+          {/* === 9. HIDDEN SECTION — less common inputs === */}
+          <div className="form-section" style={{marginTop:8}}>
+            <div
+              style={{fontSize:11, color:'var(--text3)', cursor:'pointer', display:'flex', alignItems:'center', gap:6}}
+              onClick={() => updateForm('_showAdvanced', !form._showAdvanced)}
+            >
+              <span style={{fontSize:14}}>{form._showAdvanced ? '▾' : '▸'}</span>
+              <span style={{textTransform:'uppercase', letterSpacing:'0.05em'}}>Additional Options</span>
+            </div>
+            {form._showAdvanced && (
+              <div style={{marginTop:8}}>
+                {/* Subordinate Financing */}
+                <h4 style={{fontSize:11, color:'var(--text3)', margin:'0 0 4px 0'}}>Subordinate Financing</h4>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label>Sub. Lien Balance ($)</label>
+                    <input type="text" value={form.subordinate_lien_balance ? formatCurrency(form.subordinate_lien_balance) : ''} onChange={e => updateForm('subordinate_lien_balance', parseCurrency(e.target.value) || '')} placeholder="0" />
+                  </div>
+                  <div className="form-group">
+                    <label>HELOC Credit Limit ($)</label>
+                    <input type="text" value={form.heloc_credit_limit ? formatCurrency(form.heloc_credit_limit) : ''} onChange={e => updateForm('heloc_credit_limit', parseCurrency(e.target.value) || '')} placeholder="0" />
+                  </div>
+                </div>
+                {(() => {
+                  const pv = Number(form.property_value) || 0;
+                  const la = Number(form.loan_amount) || 0;
+                  const appr = Number(form.appraised_value) || 0;
+                  const effPV = (form.purpose === 'purchase' && appr > 0) ? Math.min(pv, appr) : pv;
+                  const subBal = Number(form.subordinate_lien_balance) || 0;
+                  const helocLimit = Number(form.heloc_credit_limit) || 0;
+                  const unfundedHeloc = Math.max(0, helocLimit - subBal);
+                  const cltv = effPV > 0 ? Math.floor(((la + subBal) / effPV) * 10000) / 100 : 0;
+                  const hcltv = effPV > 0 ? Math.floor(((la + subBal + unfundedHeloc) / effPV) * 10000) / 100 : 0;
+                  const show = subBal > 0 || helocLimit > 0;
+                  if (!show) return null;
+                  return (
+                    <div className="form-row" style={{marginTop:2}}>
+                      <div className="form-group">
+                        <label>CLTV</label>
+                        <input readOnly value={cltv.toFixed(2) + '%'} style={{color:'var(--accent)', fontWeight:600}} />
+                      </div>
+                      {helocLimit > 0 && (
+                        <div className="form-group">
+                          <label>HCLTV</label>
+                          <input readOnly value={hcltv.toFixed(2) + '%'} style={{color:'var(--accent)', fontWeight:600}} />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Subordination (refi only) */}
+                {(form.purpose === 'rate_term_refi' || form.purpose === 'cash_out_refi') && (
+                  <div className="form-row" style={{marginTop:8}}>
+                    <div className="form-group">
+                      <label style={{display:'flex', alignItems:'center', gap:6}}>
+                        <input type="checkbox" checked={form.subordination} onChange={e => updateForm('subordination', e.target.checked)} style={{width:'auto'}} />
+                        Subordination (existing 2nd lien stays)
+                      </label>
+                    </div>
+                  </div>
+                )}
+
+                {/* ZIP */}
+                <div className="form-row" style={{marginTop:8}}>
+                  <div className="form-group">
+                    <label>ZIP Code</label>
+                    <input value={form.zip_code} onChange={e => updateForm('zip_code', e.target.value)} maxLength={10} placeholder="27601" />
+                    <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>For future closing cost API integration.</div>
+                  </div>
+                </div>
+
+                {/* Excluded Products */}
+                <div className="form-row" style={{marginTop:8}}>
+                  <div className="form-group">
+                    <label>Exclude Products</label>
+                    <input value={form.excluded_products} onChange={e => updateForm('excluded_products', e.target.value)} placeholder="e.g. FHA30_203K" />
+                    <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Comma-separated product codes hidden from results.</div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
 
           <button className="btn btn-primary" onClick={runPrice} disabled={!connected || loading}>
             {loading ? 'Pricing...' : 'Run Pricing Engine'}
