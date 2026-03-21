@@ -730,11 +730,12 @@ function downloadPricingExcel(response, eligibleGroups, form) {
   if (!window.XLSX) { alert('SheetJS library not loaded'); return; }
   const wb = XLSX.utils.book_new();
 
-  const tilYears = Number(form.time_in_loan_years) || 4.25;
+  const tilYears = getEffectiveTimeInLoan(form);
   const tilMonths = Math.round(tilYears * 12);
   const threeYearMonths = 36;
   const monthlyEscrow = Math.round((Number(form.property_value) || 0) * (Number(form.escrow_annual_rate) || 1.25) / 100 / 12);
   const monthlyIncome = (Number(form.borrower_income) || 0) / 12;
+  const additionalDebt = Number(form.additional_debt_service) || 0;
   const origFee = Number(form.origination_fee) || 1500;
 
   // --- Build flat list with analysis columns ---
@@ -772,8 +773,8 @@ function downloadPricingExcel(response, eligibleGroups, form) {
       const mi3yr = monthlyMI * Math.min(threeYearMonths, miDurationMo);
       const cost3yr = totalUpfront + interest3yr + mi3yr;
       // AR: Monthly Escrow
-      // AS: DTI
-      const dti = monthlyIncome > 0 ? (r.pricing.total_monthly_payment + monthlyEscrow) / monthlyIncome : 0;
+      // AS: DTI = (housing payment + escrow + additional debt service) / monthly income
+      const dti = monthlyIncome > 0 ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome : 0;
 
       allRows.push({
         _product_code: r.product_code,
@@ -860,36 +861,34 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     sorted3.forEach((row, i) => { row['Rank 3-Year'] = i + 1; });
     if (sorted3.length > 0) sorted3[0]['3-Year Winner'] = '3-Year Winner';
 
-    // Lowest / Highest APR within product code
-    const sortedAPR = [...group].sort((a, b) => a['APR %'] - b['APR %']);
-    if (sortedAPR.length > 0) {
-      sortedAPR[0]['Lowest APR'] = 'Lowest APR';
-      sortedAPR[sortedAPR.length - 1]['Highest APR'] = 'Highest APR';
-    }
   }
 
-  // --- Best of Product per category (lowest total cost in category) ---
-  const byCategory = new Map();
-  for (const row of allRows) {
-    const cat = row._product_category;
-    if (!byCategory.has(cat)) byCategory.set(cat, []);
-    byCategory.get(cat).push(row);
+  // --- Global flags (across ALL eligible results) for intro statement ---
+
+  // Best overall option (lowest total cost across everything)
+  if (allRows.length > 0) {
+    const globalBest = allRows.reduce((best, row) => row['Total Cost Over TIL'] < best['Total Cost Over TIL'] ? row : best);
+    globalBest['Best of Product'] = 'Best Overall';
   }
-  for (const [cat, group] of byCategory) {
-    const bestRank = Math.min(...group.map(r => r['Rank (Total Cost)']));
-    // Among all rows in this category that have rank 1 within their product code, find the one with lowest total cost
-    let bestRow = null;
-    let bestCost = Infinity;
-    for (const row of group) {
-      if (row['Total Cost Over TIL'] < bestCost) {
-        bestCost = row['Total Cost Over TIL'];
-        bestRow = row;
-      }
-    }
-    if (bestRow) {
-      const catLabel = cat === 'conventional' ? 'Best Conventional' : cat === 'fha' ? 'Best FHA' : cat === 'va' ? 'Best VA' : `Best ${cat}`;
-      bestRow['Best of Product'] = catLabel;
-    }
+
+  // Global Lowest / Highest APR
+  if (allRows.length > 0) {
+    const globalAPRSorted = [...allRows].sort((a, b) => a['APR %'] - b['APR %']);
+    globalAPRSorted[0]['Lowest APR'] = 'Lowest APR';
+    globalAPRSorted[globalAPRSorted.length - 1]['Highest APR'] = 'Highest APR';
+  }
+
+  // Global min/max transaction costs (Total Upfront Costs)
+  let globalMinUpfront = Infinity, globalMaxUpfront = -Infinity;
+  let globalMinAPR = Infinity, globalMaxAPR = -Infinity;
+  let globalMinRate = Infinity, globalMaxRate = -Infinity;
+  for (const row of allRows) {
+    globalMinUpfront = Math.min(globalMinUpfront, row['Total Upfront Costs']);
+    globalMaxUpfront = Math.max(globalMaxUpfront, row['Total Upfront Costs']);
+    globalMinAPR = Math.min(globalMinAPR, row['APR %']);
+    globalMaxAPR = Math.max(globalMaxAPR, row['APR %']);
+    globalMinRate = Math.min(globalMinRate, row['Rate %']);
+    globalMaxRate = Math.max(globalMaxRate, row['Rate %']);
   }
 
   // --- Build Sheet 1: All Rate Options ---
@@ -953,8 +952,40 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     XLSX.utils.book_append_sheet(wb, ws3, 'LLPA Breakdown');
   }
 
-  // --- Sheet 4: Scenario Inputs ---
+  // --- Sheet 4: Scenario Inputs + Summary ---
+  const totalOfferings = response.meta.total_offerings_reviewed || response.results?.length || 0;
+  const investorsQueried = response.meta.investors_queried || 0;
+
+  // Build intro statement
+  const fmtRate = (v) => v === Infinity || v === -Infinity ? '—' : v.toFixed(3) + '%';
+  const fmtDollars = (v) => {
+    if (v === Infinity || v === -Infinity) return '—';
+    const abs = Math.abs(Math.round(v));
+    const formatted = '$' + abs.toLocaleString();
+    return v < 0 ? '(' + formatted + ')' : formatted;
+  };
+  const introStatement = allRows.length > 0
+    ? `We reviewed ${totalOfferings.toLocaleString()} product offerings across ${investorsQueried} investor${investorsQueried !== 1 ? 's' : ''}, with rates ranging from ${fmtRate(globalMinRate)} to ${fmtRate(globalMaxRate)} and net transaction costs from ${fmtDollars(globalMinUpfront)} to ${fmtDollars(globalMaxUpfront)}.`
+    : 'No eligible products found for this scenario.';
+
   const scenarioRows = [
+    { 'Field': '--- INTRO STATEMENT ---', 'Value': '' },
+    { 'Field': 'Intro', 'Value': introStatement },
+    { 'Field': '', 'Value': '' },
+    { 'Field': '--- SUMMARY STATS ---', 'Value': '' },
+    { 'Field': 'Total Offerings Reviewed', 'Value': totalOfferings },
+    { 'Field': 'Investors Queried', 'Value': investorsQueried },
+    { 'Field': 'Eligible Rate Options', 'Value': response.meta.total_rate_options },
+    { 'Field': 'Products Eligible', 'Value': response.meta.products_eligible },
+    { 'Field': 'Products Ineligible', 'Value': response.meta.products_ineligible },
+    { 'Field': 'Lowest Rate', 'Value': globalMinRate !== Infinity ? globalMinRate : '' },
+    { 'Field': 'Highest Rate', 'Value': globalMaxRate !== -Infinity ? globalMaxRate : '' },
+    { 'Field': 'Lowest APR', 'Value': globalMinAPR !== Infinity ? globalMinAPR : '' },
+    { 'Field': 'Highest APR', 'Value': globalMaxAPR !== -Infinity ? globalMaxAPR : '' },
+    { 'Field': 'Min Net Transaction Costs', 'Value': globalMinUpfront !== Infinity ? Math.round(globalMinUpfront * 100) / 100 : '' },
+    { 'Field': 'Max Net Transaction Costs', 'Value': globalMaxUpfront !== -Infinity ? Math.round(globalMaxUpfront * 100) / 100 : '' },
+    { 'Field': '', 'Value': '' },
+    { 'Field': '--- SCENARIO INPUTS ---', 'Value': '' },
     { 'Field': 'Loan Amount', 'Value': form.loan_amount },
     { 'Field': 'Property Value', 'Value': form.property_value },
     { 'Field': 'FICO', 'Value': form.fico_score },
@@ -964,7 +995,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     { 'Field': 'State', 'Value': form.state_code },
     { 'Field': 'County', 'Value': form.county_name || '' },
     { 'Field': 'Borrower Income', 'Value': form.borrower_income || '' },
-    { 'Field': 'DTI %', 'Value': form.dti_ratio || '' },
+    { 'Field': 'Additional Debt Service ($/mo)', 'Value': additionalDebt },
     { 'Field': 'Veteran', 'Value': form.is_veteran ? 'Yes' : 'No' },
     { 'Field': 'First-Time Buyer', 'Value': form.is_first_time_buyer ? 'Yes' : 'No' },
     { 'Field': 'Escrow Waiver', 'Value': form.escrow_waiver },
@@ -977,11 +1008,10 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     { 'Field': 'Time in Loan (months)', 'Value': tilMonths },
     { 'Field': 'Monthly Escrow', 'Value': monthlyEscrow },
     { 'Field': 'Excluded Products', 'Value': form.excluded_products },
-    { 'Field': 'Products Eligible', 'Value': response.meta.products_eligible },
     { 'Field': 'Execution Time (ms)', 'Value': response.meta.execution_ms },
   ];
   const ws4 = XLSX.utils.json_to_sheet(scenarioRows);
-  ws4['!cols'] = [{ wch: 24 }, { wch: 30 }];
+  ws4['!cols'] = [{ wch: 28 }, { wch: 120 }];
   XLSX.utils.book_append_sheet(wb, ws4, 'Scenario');
 
   // --- Sheet 5: Ineligible Products ---
@@ -1160,6 +1190,7 @@ async function runPricing(client, scenario) {
     meta: {
       execution_ms: Date.now() - start,
       investors_queried: investors?.length || 0,
+      total_offerings_reviewed: ranked.length, // all rate options across all investors (eligible + ineligible)
       total_rate_options: ranked.filter(r => r.eligibility.is_eligible && r.pricing).length,
       products_eligible: new Set(ranked.filter(r => r.eligibility.is_eligible && r.pricing).map(r => r.product_code)).size,
       products_ineligible: new Set(ranked.filter(r => !r.eligibility.is_eligible).map(r => r.product_code)).size,
@@ -1479,7 +1510,7 @@ function App() {
     county_name: '',              // County name (for conforming limits, AMI lookup)
     zip_code: '',                 // Property ZIP code
     borrower_income: '',          // Annual borrower income ($) — for AMI determination
-    dti_ratio: '',
+    additional_debt_service: 250, // Monthly non-housing debt payments ($) — car, student loans, credit cards
     num_units: '',
     preferred_lock_days: 45,      // Will be auto-set by getDefaultLockDays
     preferred_term_months: 360,
@@ -1501,7 +1532,7 @@ function App() {
     fees_in: false,               // false = fees-out (fees shown separately), true = fees baked into rate/price
     escrow_annual_rate: 1.25,     // Annual escrow estimate as % of property value (taxes + insurance)
     // Analysis options
-    time_in_loan_years: 4.25,     // Expected hold period (years) — drives total cost analysis
+    time_in_loan_override: '',    // Manual override for time in loan (years). Empty = auto-calculate.
     excluded_products: 'FHA30_203K', // Comma-separated product codes to hide from results & downloads
   });
 
@@ -1527,6 +1558,26 @@ function App() {
     const isRefi = f.purpose === 'rate_term_refi' || f.purpose === 'cash_out_refi';
     if (isRefi && f.subordination) lockDays = Math.max(lockDays, 60);
     return lockDays;
+  }
+
+  // --- Auto Time in Loan (years) ---
+  // Based on Time in Loan Scenarios logic from Jason's workbook.
+  // Purpose + borrower flags → default hold period. User can override.
+  function getAutoTimeInLoan(f) {
+    if (f.purpose === 'purchase') {
+      if (f.is_first_time_buyer) return 2;      // Purchase + FTHB
+      return 4.25;                               // Purchase default ("AI it for me")
+    }
+    if (f.purpose === 'cash_out_refi') return 0.9;  // Cash-out refi — short hold
+    if (f.purpose === 'rate_term_refi') return 5.25; // Rate/term refi — save monthly
+    return 4.25; // fallback
+  }
+
+  function getEffectiveTimeInLoan(f) {
+    if (f.time_in_loan_override && Number(f.time_in_loan_override) > 0) {
+      return Number(f.time_in_loan_override);
+    }
+    return getAutoTimeInLoan(f);
   }
 
   // Auto-update lock period when relevant fields change
@@ -1580,7 +1631,7 @@ function App() {
       fico_score: Number(form.fico_score),
       preferred_lock_days: Number(form.preferred_lock_days),
       preferred_term_months: Number(form.preferred_term_months),
-      dti_ratio: form.dti_ratio ? Number(form.dti_ratio) : undefined,
+      dti_ratio: undefined, // DTI is now computed from outputs, not an input. Eligibility knockouts will skip if undefined.
       num_units: form.num_units ? Number(form.num_units) : undefined,
       subordinate_lien_balance: form.subordinate_lien_balance ? Number(form.subordinate_lien_balance) : undefined,
       heloc_credit_limit: form.heloc_credit_limit ? Number(form.heloc_credit_limit) : undefined,
@@ -1702,10 +1753,6 @@ function App() {
               <div className="form-group">
                 <label>FICO Score</label>
                 <input type="number" value={form.fico_score} onChange={e => updateForm('fico_score', e.target.value)} />
-              </div>
-              <div className="form-group">
-                <label>DTI % (optional)</label>
-                <input type="number" value={form.dti_ratio} onChange={e => updateForm('dti_ratio', e.target.value)} placeholder="e.g. 38" />
               </div>
             </div>
             <div className="form-section" style={{margin:0, padding:'6px 0 0 0', border:'none'}}>
@@ -1889,15 +1936,6 @@ function App() {
             <h3>Analysis Settings</h3>
             <div className="form-row">
               <div className="form-group">
-                <label>Time in Loan (years)</label>
-                <input type="number" step="0.25" value={form.time_in_loan_years} onChange={e => updateForm('time_in_loan_years', e.target.value)} />
-                <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
-                  Drives total cost & 3-year analysis in Excel download.
-                </div>
-              </div>
-            </div>
-            <div className="form-row">
-              <div className="form-group">
                 <label>Exclude Products (comma-separated)</label>
                 <input value={form.excluded_products} onChange={e => updateForm('excluded_products', e.target.value)} placeholder="e.g. FHA30_203K, FHA30_HB" />
                 <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>
@@ -1936,6 +1974,13 @@ function App() {
                       <label>Borrower Income (annual $)</label>
                       <input type="text" value={form.borrower_income ? formatCurrency(form.borrower_income) : ''} onChange={e => updateForm('borrower_income', parseCurrency(e.target.value) || '')} placeholder="e.g. $75,000" />
                     </div>
+                    <div className="form-group">
+                      <label>Additional Debt Service ($/mo)</label>
+                      <input type="text" value={formatCurrency(form.additional_debt_service)} onChange={e => updateForm('additional_debt_service', parseCurrency(e.target.value))} placeholder="$250" />
+                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Car, student loans, credit cards, etc.</div>
+                    </div>
+                  </div>
+                  <div className="form-row">
                     <div className="form-group">
                       {amiInfo ? (
                         <div style={{fontSize:10, marginTop:16}}>
@@ -2018,6 +2063,46 @@ function App() {
             </div>
           )}
 
+          {/* Time in Loan — auto-calculated, overridable */}
+          {(() => {
+            const autoTIL = getAutoTimeInLoan(form);
+            const effTIL = getEffectiveTimeInLoan(form);
+            const isOverridden = form.time_in_loan_override && Number(form.time_in_loan_override) > 0;
+            const reasonMap = {
+              'purchase': form.is_first_time_buyer ? 'Purchase + FTHB' : 'Purchase',
+              'cash_out_refi': 'Cash-Out Refi',
+              'rate_term_refi': 'Rate/Term Refi',
+              'heloc': 'HELOC',
+              'heloan': 'HELOAN',
+            };
+            return (
+              <div className="form-section" style={{background:'var(--bg)', borderRadius:6, padding:10, marginTop:8}}>
+                <div style={{display:'flex', alignItems:'center', gap:10}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11, color:'var(--text3)', textTransform:'uppercase', letterSpacing:'0.05em', marginBottom:4}}>Time in Loan</div>
+                    <div style={{fontSize:20, fontWeight:700, color:'var(--accent)'}}>{effTIL} years <span style={{fontSize:12, fontWeight:400, color:'var(--text3)'}}>({Math.round(effTIL * 12)} months)</span></div>
+                    <div style={{fontSize:10, color: isOverridden ? 'var(--orange)' : 'var(--text3)', marginTop:2}}>
+                      {isOverridden
+                        ? `Manual override (auto: ${autoTIL}yr for ${reasonMap[form.purpose] || form.purpose})`
+                        : `Auto: ${reasonMap[form.purpose] || form.purpose}`
+                      }
+                    </div>
+                  </div>
+                  <div style={{width:80}}>
+                    <label style={{fontSize:10, color:'var(--text3)'}}>Override</label>
+                    <input
+                      type="number" step="0.25" min="0"
+                      value={form.time_in_loan_override}
+                      onChange={e => updateForm('time_in_loan_override', e.target.value)}
+                      placeholder={String(autoTIL)}
+                      style={{width:'100%', background:'var(--bg2)', border:'1px solid var(--border)', borderRadius:4, padding:'4px 6px', color:'var(--text)', fontSize:12, textAlign:'center'}}
+                    />
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           <button className="btn btn-primary" onClick={runPrice} disabled={!connected || loading}>
             {loading ? 'Pricing...' : 'Run Pricing Engine'}
           </button>
@@ -2046,7 +2131,8 @@ function App() {
               <div className="exec-bar">
                 <div className="exec-stat"><span className="label">Time: </span><span className="value">{response.meta.execution_ms}ms</span></div>
                 <div className="exec-stat"><span className="label">Investors: </span><span className="value">{response.meta.investors_queried}</span></div>
-                <div className="exec-stat"><span className="label">Rate Options: </span><span className="value">{response.meta.total_rate_options}</span></div>
+                <div className="exec-stat"><span className="label">Offerings Reviewed: </span><span className="value">{response.meta.total_offerings_reviewed}</span></div>
+                <div className="exec-stat"><span className="label">Eligible Options: </span><span className="value">{response.meta.total_rate_options}</span></div>
                 <div className="exec-stat"><span className="label">Products Eligible: </span><span className="value" style={{color:'var(--green)'}}>{response.meta.products_eligible}</span></div>
                 <div className="exec-stat"><span className="label">Ineligible: </span><span className="value" style={{color:'var(--red)'}}>{response.meta.products_ineligible}</span></div>
                 <button
