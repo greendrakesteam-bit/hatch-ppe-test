@@ -161,7 +161,7 @@ class ErrorBoundary extends Component {
 // =============================================
 
 // --- Validation ---
-const VALID_PURPOSES = ["purchase","rate_term_refi","cash_out_refi","heloc","heloan"];
+const VALID_PURPOSES = ["purchase","rate_term_refi","cash_out_refi","home_equity"];
 const VALID_PROPERTY_TYPES = ["single_family","condo","townhome","multi_unit_2","multi_unit_3","multi_unit_4","manufactured_home","pud"];
 const VALID_OCCUPANCY = ["primary_residence","secondary_residence","investment_property"];
 
@@ -243,7 +243,7 @@ const PURPOSE_KEYWORDS = {
   purchase: ["Purchase Money", "Purchase"],
   rate_term_refi: ["Limited Cash-Out"],
   cash_out_refi: ["Cash-Out Refi", "Cash-Out"],
-  heloc: [], heloan: [],
+  home_equity: [],
 };
 const ALL_PURPOSE_KW = ["Purchase Money","Purchase","Limited Cash-Out","Cash-Out Refi","Cash-Out"];
 
@@ -724,6 +724,27 @@ function cumipmt(annualRatePercent, totalPeriods, pv, startPeriod, endPeriod) {
     balance -= principal;
   }
   return totalInterest;
+}
+
+// --- Auto Time in Loan (years) ---
+// Based on Time in Loan Scenarios logic from Jason's workbook.
+// Purpose + borrower flags → default hold period. User can override.
+function getAutoTimeInLoan(f) {
+  if (f.purpose === 'purchase') {
+    if (f.is_first_time_buyer) return 2;      // Purchase + FTHB
+    return 4.25;                               // Purchase default ("AI it for me")
+  }
+  if (f.purpose === 'cash_out_refi') return 0.9;  // Cash-out refi — short hold
+  if (f.purpose === 'rate_term_refi') return 5.25; // Rate/term refi — save monthly
+  if (f.purpose === 'home_equity') return 4.25;    // Home equity — default
+  return 4.25; // fallback
+}
+
+function getEffectiveTimeInLoan(f) {
+  if (f.time_in_loan_override && Number(f.time_in_loan_override) > 0) {
+    return Number(f.time_in_loan_override);
+  }
+  return getAutoTimeInLoan(f);
 }
 
 function downloadPricingExcel(response, eligibleGroups, form) {
@@ -1506,6 +1527,7 @@ function App() {
     borrower_income: '',          // Annual borrower income ($) — for AMI determination
     additional_debt_service: 250, // Monthly non-housing debt payments ($) — car, student loans, credit cards
     num_units: '',
+    first_mortgage_balance: '',   // Home equity: existing 1st mortgage balance. $0 = first-lien HE product.
     preferred_lock_days: 45,      // Will be auto-set by getDefaultLockDays
     preferred_term_months: 360,
     // Subordinate financing
@@ -1552,26 +1574,6 @@ function App() {
     const isRefi = f.purpose === 'rate_term_refi' || f.purpose === 'cash_out_refi';
     if (isRefi && f.subordination) lockDays = Math.max(lockDays, 60);
     return lockDays;
-  }
-
-  // --- Auto Time in Loan (years) ---
-  // Based on Time in Loan Scenarios logic from Jason's workbook.
-  // Purpose + borrower flags → default hold period. User can override.
-  function getAutoTimeInLoan(f) {
-    if (f.purpose === 'purchase') {
-      if (f.is_first_time_buyer) return 2;      // Purchase + FTHB
-      return 4.25;                               // Purchase default ("AI it for me")
-    }
-    if (f.purpose === 'cash_out_refi') return 0.9;  // Cash-out refi — short hold
-    if (f.purpose === 'rate_term_refi') return 5.25; // Rate/term refi — save monthly
-    return 4.25; // fallback
-  }
-
-  function getEffectiveTimeInLoan(f) {
-    if (f.time_in_loan_override && Number(f.time_in_loan_override) > 0) {
-      return Number(f.time_in_loan_override);
-    }
-    return getAutoTimeInLoan(f);
   }
 
   // Auto-update lock period when relevant fields change
@@ -1629,6 +1631,7 @@ function App() {
       num_units: form.property_type === 'multi_unit_2' ? 2 : form.property_type === 'multi_unit_3' ? 3 : form.property_type === 'multi_unit_4' ? 4 : 1,
       subordinate_lien_balance: form.subordinate_lien_balance ? Number(form.subordinate_lien_balance) : undefined,
       heloc_credit_limit: form.heloc_credit_limit ? Number(form.heloc_credit_limit) : undefined,
+      first_mortgage_balance: form.first_mortgage_balance ? Number(form.first_mortgage_balance) : 0,
       county_name: form.county_name || undefined,
       zip_code: form.zip_code || undefined,
       escrow_waiver: form.escrow_waiver || 'none',
@@ -1732,8 +1735,7 @@ function App() {
                   <option value="purchase">Purchase</option>
                   <option value="rate_term_refi">Rate/Term Refi</option>
                   <option value="cash_out_refi">Cash-Out Refi</option>
-                  <option value="heloc">HELOC</option>
-                  <option value="heloan">HELOAN</option>
+                  <option value="home_equity">Home Equity</option>
                 </select>
               </div>
             </div>
@@ -1748,15 +1750,18 @@ function App() {
                 <input type="text" value={formatCurrency(form.property_value)} onChange={e => updateForm('property_value', parseCurrency(e.target.value))} />
               </div>
               <div className="form-group">
-                <label>Loan Amount</label>
+                <label>{form.purpose === 'home_equity' ? 'HELOC / HELOAN Amount' : 'Loan Amount'}</label>
                 <input type="text" value={formatCurrency(form.loan_amount)} onChange={e => updateForm('loan_amount', parseCurrency(e.target.value))} />
               </div>
             </div>
-            {form.purpose === 'purchase' && (
+            {form.purpose === 'home_equity' && (
               <div className="form-row">
                 <div className="form-group">
-                  <label>Appraised Value <span style={{fontSize:10, color:'var(--text3)'}}>(if different)</span></label>
-                  <input type="text" value={form.appraised_value ? formatCurrency(form.appraised_value) : ''} onChange={e => updateForm('appraised_value', parseCurrency(e.target.value) || '')} placeholder="Same as purchase price" />
+                  <label>First Mortgage Balance ($)</label>
+                  <input type="text" value={form.first_mortgage_balance ? formatCurrency(form.first_mortgage_balance) : ''} onChange={e => updateForm('first_mortgage_balance', parseCurrency(e.target.value) || '')} placeholder="$0 = first-lien" />
+                  <div style={{fontSize:10, color: !form.first_mortgage_balance || Number(form.first_mortgage_balance) === 0 ? 'var(--accent)' : 'var(--text3)', marginTop:2}}>
+                    {!form.first_mortgage_balance || Number(form.first_mortgage_balance) === 0 ? 'First-lien home equity (no existing mortgage)' : 'Second-lien behind existing first mortgage'}
+                  </div>
                 </div>
               </div>
             )}
@@ -1837,7 +1842,7 @@ function App() {
             </div>
           </div>
 
-          {/* === 4. FICO === */}
+          {/* === 4. BORROWER (FICO + Income + Debt) === */}
           <div className="form-section">
             <h3>Borrower</h3>
             <div className="form-row">
@@ -1846,6 +1851,37 @@ function App() {
                 <input type="number" value={form.fico_score} onChange={e => updateForm('fico_score', e.target.value)} />
               </div>
             </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Borrower Income (annual $)</label>
+                <input type="text" value={form.borrower_income ? formatCurrency(form.borrower_income) : ''} onChange={e => updateForm('borrower_income', parseCurrency(e.target.value) || '')} placeholder="e.g. $75,000" />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Additional Debt Service ($/mo)</label>
+                <input type="text" value={formatCurrency(form.additional_debt_service)} onChange={e => updateForm('additional_debt_service', parseCurrency(e.target.value))} placeholder="$250" />
+                <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Car, student loans, cards, etc.</div>
+              </div>
+            </div>
+            {(() => {
+              const amiInfo = lookupAMI(form.state_code, form.county_name);
+              const income = Number(form.borrower_income) || 0;
+              const hasIncome = income > 0 && amiInfo;
+              const isBelow80 = hasIncome && income <= amiInfo.ami_80;
+              const isBelow100 = hasIncome && income <= amiInfo.ami_100;
+              return (
+                <>
+                  {amiInfo && hasIncome && (
+                    <div style={{fontSize:10, marginTop:2, fontWeight:600, color: isBelow80 ? 'var(--green)' : isBelow100 ? '#d4a017' : 'var(--text3)'}}>
+                      {isBelow80 ? '✓ AMI ≤80% — FNMA LLPA waiver applies' : isBelow100 ? '✓ AMI ≤100%' : `Above 100% AMI ($${amiInfo.ami_100.toLocaleString()})`}
+                    </div>
+                  )}
+                  <input type="hidden" value={isBelow80} />
+                  <input type="hidden" value={isBelow100} />
+                </>
+              );
+            })()}
           </div>
 
           {/* === 5. PRICING DISPLAY === */}
@@ -1895,41 +1931,7 @@ function App() {
             </div>
           </div>
 
-          {/* === 6. INCOME & DEBT SERVICE === */}
-          <div className="form-section">
-            <h3>Income & Debt</h3>
-            {(() => {
-              const amiInfo = lookupAMI(form.state_code, form.county_name);
-              const income = Number(form.borrower_income) || 0;
-              const hasIncome = income > 0 && amiInfo;
-              const isBelow80 = hasIncome && income <= amiInfo.ami_80;
-              const isBelow100 = hasIncome && income <= amiInfo.ami_100;
-              return (
-                <div style={{marginBottom:4}}>
-                  <div className="form-row">
-                    <div className="form-group">
-                      <label>Borrower Income (annual $)</label>
-                      <input type="text" value={form.borrower_income ? formatCurrency(form.borrower_income) : ''} onChange={e => updateForm('borrower_income', parseCurrency(e.target.value) || '')} placeholder="e.g. $75,000" />
-                    </div>
-                    <div className="form-group">
-                      <label>Additional Debt Service ($/mo)</label>
-                      <input type="text" value={formatCurrency(form.additional_debt_service)} onChange={e => updateForm('additional_debt_service', parseCurrency(e.target.value))} placeholder="$250" />
-                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Car, student loans, cards, etc.</div>
-                    </div>
-                  </div>
-                  {amiInfo && hasIncome && (
-                    <div style={{fontSize:10, marginTop:2, fontWeight:600, color: isBelow80 ? 'var(--green)' : isBelow100 ? '#d4a017' : 'var(--text3)'}}>
-                      {isBelow80 ? '✓ AMI ≤80% — FNMA LLPA waiver applies' : isBelow100 ? '✓ AMI ≤100%' : `Above 100% AMI ($${amiInfo.ami_100.toLocaleString()})`}
-                    </div>
-                  )}
-                  <input type="hidden" value={isBelow80} />
-                  <input type="hidden" value={isBelow100} />
-                </div>
-              );
-            })()}
-          </div>
-
-          {/* === 7. SCENARIO FLAGS === */}
+          {/* === 6. SCENARIO FLAGS === */}
           <div className="form-section">
             <h3>Scenario Flags</h3>
             <div className="form-row">
@@ -1995,8 +1997,7 @@ function App() {
               'purchase': form.is_first_time_buyer ? 'Purchase + FTHB' : 'Purchase',
               'cash_out_refi': 'Cash-Out Refi',
               'rate_term_refi': 'Rate/Term Refi',
-              'heloc': 'HELOC',
-              'heloan': 'HELOAN',
+              'home_equity': 'Home Equity',
             };
             return (
               <div className="form-section" style={{background:'var(--bg)', borderRadius:6, padding:10}}>
@@ -2037,6 +2038,17 @@ function App() {
             </div>
             {form._showAdvanced && (
               <div style={{marginTop:8}}>
+                {/* Appraised Value (purchase only) */}
+                {form.purpose === 'purchase' && (
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label>Appraised Value <span style={{fontSize:10, color:'var(--text3)'}}>(if different from purchase price)</span></label>
+                      <input type="text" value={form.appraised_value ? formatCurrency(form.appraised_value) : ''} onChange={e => updateForm('appraised_value', parseCurrency(e.target.value) || '')} placeholder="Same as purchase price" />
+                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>LTV uses min(price, appraisal) per FNMA rules.</div>
+                    </div>
+                  </div>
+                )}
+
                 {/* Subordinate Financing */}
                 <h4 style={{fontSize:11, color:'var(--text3)', margin:'0 0 4px 0'}}>Subordinate Financing</h4>
                 <div className="form-row">
