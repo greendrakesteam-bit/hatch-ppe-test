@@ -652,9 +652,23 @@ function calcAPR(loanAmount, ratePercent, pricePoints, termMonths) {
 }
 
 // --- Ranking ---
-function rankResults(results) {
+function rankResults(results, opts) {
+  const feesIn = opts?.fees_in || false;
+  const origFee = opts?.origination_fee || 0;
+  const loanAmt = opts?.loan_amount || 0;
+  const origFeePoints = (feesIn && loanAmt > 0) ? (origFee / loanAmt) * 100 : 0;
+
   const eligible = results.filter(r => r.eligibility.is_eligible);
   const ineligible = results.filter(r => !r.eligibility.is_eligible);
+
+  // Compute adjusted_final_price on every eligible result
+  // Fees-in: origination fee converted to points and subtracted from price
+  // Fees-out: adjusted = raw (no change)
+  for (const r of eligible) {
+    r.pricing.adjusted_final_price = feesIn
+      ? r.pricing.final_price_points - origFeePoints
+      : r.pricing.final_price_points;
+  }
 
   const groups = new Map();
   for (const r of eligible) {
@@ -665,15 +679,16 @@ function rankResults(results) {
 
   for (const [, group] of groups) {
     group.sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
-    let parIdx = 0, closest = Math.abs(group[0].pricing.final_price_points - 100);
+    // Par = closest to 100 using ADJUSTED price (reflects fees-in shift)
+    let parIdx = 0, closest = Math.abs(group[0].pricing.adjusted_final_price - 100);
     for (let i = 1; i < group.length; i++) {
-      const d = Math.abs(group[i].pricing.final_price_points - 100);
+      const d = Math.abs(group[i].pricing.adjusted_final_price - 100);
       if (d < closest) { closest = d; parIdx = i; }
     }
     for (let i = 0; i < group.length; i++) {
-      const fp = group[i].pricing.final_price_points;
+      const afp = group[i].pricing.adjusted_final_price;
       if (i === parIdx) { group[i].is_par_rate = true; group[i].rate_option = "par"; }
-      else if (fp < 100) { group[i].is_par_rate = false; group[i].rate_option = "below_par"; }
+      else if (afp < 100) { group[i].is_par_rate = false; group[i].rate_option = "below_par"; }
       else { group[i].is_par_rate = false; group[i].rate_option = "above_par"; }
     }
     group.sort((a, b) => a.pricing.apr - b.pricing.apr);
@@ -766,7 +781,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
       const rateP = r.pricing.base_rate_percent;
       const termMo = r.term_months;
       const totalLoan = r.pricing.total_loan_amount;
-      const finalPrice = r.pricing.final_price_points;
+      const finalPrice = r.pricing.adjusted_final_price ?? r.pricing.final_price_points;
       const monthlyMI = r.pricing.government_insurance?.monthly_amount || 0;
       const upfrontFee = r.pricing.government_insurance?.upfront_fee_amount || 0;
       const estClosing = r.pricing.estimated_closing_costs;
@@ -777,10 +792,10 @@ function downloadPricingExcel(response, eligibleGroups, form) {
       const miDurationMo = r.pricing.government_insurance?.duration_months || tilMonths;
       const miMonths = Math.min(tilMonths, miDurationMo);
       const pmiCost = monthlyMI * miMonths;
-      // AC: Points/Credits — positive = borrower pays, negative = lender credit
+      // AC: Points/Credits — positive = borrower pays, negative = lender credit (uses adjusted price for fees-in)
       const pointsCredits = ((100 - finalPrice) / 100) * totalLoan;
-      // AD: Underwriting fee
-      const uwFee = origFee;
+      // AD: Underwriting fee (fees-in: $0 because it's already baked into the adjusted price/points)
+      const uwFee = form.fees_in ? 0 : origFee;
       // AE: Upfront MIP / Funding Fees
       const upfrontMipFf = upfrontFee;
       // AF: Other closing costs
@@ -1199,7 +1214,11 @@ async function runPricing(client, scenario) {
     }
   }
 
-  const ranked = rankResults(results);
+  const ranked = rankResults(results, {
+    fees_in: scenario.fees_in || false,
+    origination_fee: Number(scenario.origination_fee) || 0,
+    loan_amount: scenario.loan_amount || 0,
+  });
   return {
     results: ranked, errors,
     meta: {
@@ -1361,7 +1380,7 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                 <span className="detail">|</span>
                 <span className="detail">{parRate.pricing.apr.toFixed(4)}% APR</span>
                 <span className="detail">|</span>
-                <span className="detail">Price: {parRate.pricing.final_price_points.toFixed(4)}</span>
+                <span className="detail">Price: {(parRate.pricing.adjusted_final_price ?? parRate.pricing.final_price_points).toFixed(4)}</span>
               </div>
             </div>
           )}
@@ -1445,12 +1464,10 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
             </thead>
             <tbody>
               {displayed.map((r, i) => {
-                const pointsCost = ((100 - r.pricing.final_price_points) / 100) * r.pricing.final_price_points !== 100
-                  ? ((100 - r.pricing.final_price_points) / 100 * r.pricing.base_rate_percent) : 0;
-                const dollarCost = ((100 - r.pricing.final_price_points) / 100) * first.pricing.estimated_closing_costs / 0.015;
-                const actualDollarCost = Math.round(((100 - r.pricing.final_price_points) / 100) * (r.pricing.monthly_pi * r.term_months / (r.pricing.base_rate_percent/100*12)) );
-                // Simpler: discount points in dollars
-                const dpDollars = Math.round(((100 - r.pricing.final_price_points) / 100) * (loanAmount || 350000));
+                // Use adjusted_final_price (accounts for fees-in) for display
+                const afp = r.pricing.adjusted_final_price ?? r.pricing.final_price_points;
+                // Discount points in dollars based on adjusted price
+                const dpDollars = Math.round(((100 - afp) / 100) * (loanAmount || 350000));
 
                 const sortedIdx = sorted.indexOf(r);
                 const isSelected = selectedRateIdx === sortedIdx;
@@ -1462,8 +1479,8 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                       {r.pricing.base_rate_percent.toFixed(3)}%
                     </td>
                     <td>{r.pricing.base_price_points.toFixed(4)}</td>
-                    <td style={{color: r.pricing.final_price_points < 99.9 ? 'var(--red)' : r.pricing.final_price_points > 100.1 ? 'var(--green)' : 'var(--text)'}}>
-                      {r.pricing.final_price_points.toFixed(4)}
+                    <td style={{color: afp < 99.9 ? 'var(--red)' : afp > 100.1 ? 'var(--green)' : 'var(--text)'}}>
+                      {afp.toFixed(4)}
                     </td>
                     <td>${r.pricing.monthly_pi.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
                     {first.pricing.government_insurance?.type !== "none" && first.pricing.government_insurance?.monthly_amount > 0 && (
@@ -1545,7 +1562,7 @@ function App() {
     escrow_waiver: 'none',        // 'none' | 'partial' | 'full'
     // Pricing display options
     origination_fee: 1500,        // Lender origination / UW fee ($)
-    fees_in: false,               // false = fees-out (fees shown separately), true = fees baked into rate/price
+    fees_in: true,                // Purchase defaults to fees-in. Refi/HE defaults to fees-out.
     escrow_annual_rate: 1.25,     // Annual escrow estimate as % of property value (taxes + insurance)
     // Analysis options
     time_in_loan_override: '',    // Manual override for time in loan (years). Empty = auto-calculate.
@@ -1583,6 +1600,14 @@ function App() {
       setForm(prev => ({ ...prev, preferred_lock_days: newLock }));
     }
   }, [form.purpose, form.property_type, form.subordination, form.self_employed]);
+
+  // Auto-update fees-in default when purpose changes: purchase = fees-in, everything else = fees-out
+  useEffect(() => {
+    const shouldBeFeesIn = form.purpose === 'purchase';
+    if (form.fees_in !== shouldBeFeesIn) {
+      setForm(prev => ({ ...prev, fees_in: shouldBeFeesIn }));
+    }
+  }, [form.purpose]);
 
   // Currency formatting helper
   const formatCurrency = (val) => {
