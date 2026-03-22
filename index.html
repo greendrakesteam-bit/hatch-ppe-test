@@ -657,6 +657,11 @@ function rankResults(results, opts) {
   const origFee = opts?.origination_fee || 0;
   const loanAmt = opts?.loan_amount || 0;
   const origFeePoints = (feesIn && loanAmt > 0) ? (origFee / loanAmt) * 100 : 0;
+  const tilYears = opts?.til_years || 4.25;
+  const tilMonths = Math.round(tilYears * 12);
+  const escrowRate = opts?.escrow_annual_rate || 1.25;
+  const propertyValue = opts?.property_value || 0;
+  const monthlyEscrow = Math.round(propertyValue * (escrowRate / 100) / 12);
 
   const eligible = results.filter(r => r.eligibility.is_eligible);
   const ineligible = results.filter(r => !r.eligibility.is_eligible);
@@ -691,13 +696,82 @@ function rankResults(results, opts) {
       else if (afp < 100) { group[i].is_par_rate = false; group[i].rate_option = "below_par"; }
       else { group[i].is_par_rate = false; group[i].rate_option = "above_par"; }
     }
+
+    // --- Cost to Par / Interest vs Par / 2yr Return analytics ---
+    const parR = group[parIdx];
+    const parAfp = parR.pricing.adjusted_final_price;
+    const parTotalLoan = parR.pricing.total_loan_amount;
+    const parRate = parR.pricing.base_rate_percent;
+    const parTermMo = parR.term_months;
+    // Par upfront cost (points/credits in dollars using adjusted price)
+    const parPointsDollars = ((100 - parAfp) / 100) * parTotalLoan;
+    const uwFee = feesIn ? 0 : origFee;
+    const parUpfrontMI = parR.pricing.government_insurance?.upfront_fee_amount || 0;
+    const parEstClosing = parR.pricing.estimated_closing_costs || 0;
+    const parTotalUpfront = parPointsDollars + uwFee + parUpfrontMI + parEstClosing;
+    // Par interest over TIL
+    const parInterestTIL = cumipmt(parRate, parTermMo, parTotalLoan, 1, tilMonths);
+    // Par MI over TIL
+    const parMonthlyMI = parR.pricing.government_insurance?.monthly_amount || 0;
+    const parMIDurMo = parR.pricing.government_insurance?.duration_months || tilMonths;
+    const parMICost = parMonthlyMI * Math.min(tilMonths, parMIDurMo);
+    // Par total monthly (P&I + MI + escrow)
+    const parTotalMonthly = parR.pricing.total_monthly_payment + monthlyEscrow;
+
+    for (const r of group) {
+      const afp = r.pricing.adjusted_final_price;
+      const totalLoan = r.pricing.total_loan_amount;
+      const rateP = r.pricing.base_rate_percent;
+      const termMo = r.term_months;
+      const miMonthly = r.pricing.government_insurance?.monthly_amount || 0;
+      const miDurMo = r.pricing.government_insurance?.duration_months || tilMonths;
+      const miCost = miMonthly * Math.min(tilMonths, miDurMo);
+      const upfrontMI = r.pricing.government_insurance?.upfront_fee_amount || 0;
+      const estClosing = r.pricing.estimated_closing_costs || 0;
+
+      // Points/credits in dollars for this rate
+      const pointsDollars = ((100 - afp) / 100) * totalLoan;
+      const totalUpfront = pointsDollars + uwFee + upfrontMI + estClosing;
+
+      // Cost to Par = this rate's total upfront minus par's total upfront
+      // Positive = costs more upfront than par. Negative = lender credit vs par.
+      const costToPar = totalUpfront - parTotalUpfront;
+
+      // Interest vs Par = this rate's interest over TIL minus par's interest over TIL
+      // Negative = saves interest vs par. Positive = pays more interest.
+      const interestTIL = cumipmt(rateP, termMo, totalLoan, 1, tilMonths);
+      const interestVsPar = (interestTIL + miCost) - (parInterestTIL + parMICost);
+
+      // 2yr Return = (-interestVsPar - costToPar) / abs(costToPar)
+      // Net benefit as % of incremental upfront cost vs par
+      let twoYearReturn = null;
+      if (Math.abs(costToPar) >= 50) { // Noise floor: $50 min to compute meaningful return
+        twoYearReturn = (-interestVsPar - costToPar) / Math.abs(costToPar);
+      }
+
+      // Total monthly including escrow
+      const totalMonthlyFull = r.pricing.total_monthly_payment + monthlyEscrow;
+
+      // Attach analytics to result object
+      r.analytics = {
+        cost_to_par: Math.round(costToPar),
+        interest_vs_par: Math.round(interestVsPar),
+        two_year_return: twoYearReturn,
+        total_monthly_full: Math.round(totalMonthlyFull * 100) / 100,
+        monthly_savings_vs_par: Math.round((parTotalMonthly - totalMonthlyFull) * 100) / 100,
+      };
+    }
+
     group.sort((a, b) => a.pricing.apr - b.pricing.apr);
     group.forEach((r, i) => { r.product_rank = i + 1; });
   }
 
   eligible.sort((a, b) => a.pricing.apr - b.pricing.apr);
   eligible.forEach((r, i) => { r.rank = i + 1; });
-  ineligible.forEach(r => { r.rank = 0; r.product_rank = 0; r.is_par_rate = false; r.rate_option = "below_par"; });
+  ineligible.forEach(r => {
+    r.rank = 0; r.product_rank = 0; r.is_par_rate = false; r.rate_option = "below_par";
+    r.analytics = { cost_to_par: 0, interest_vs_par: 0, two_year_return: null, total_monthly_full: 0, monthly_savings_vs_par: 0 };
+  });
   return [...eligible, ...ineligible];
 }
 
@@ -863,6 +937,11 @@ function downloadPricingExcel(response, eligibleGroups, form) {
         '3-Year Winner': '',               // placeholder — filled below
         'Monthly Escrow': monthlyEscrow,
         'DTI': Math.round(dti * 10000) / 10000,
+        // Cost to Par analysis (from rankResults analytics)
+        'Cost to Par': r.analytics?.cost_to_par || 0,
+        'Interest vs Par': r.analytics?.interest_vs_par || 0,
+        'Return vs Par': r.analytics?.two_year_return !== null && r.analytics?.two_year_return !== undefined ? Math.round(r.analytics.two_year_return * 10000) / 10000 : '',
+        'Total Monthly (Full)': r.analytics?.total_monthly_full || 0,
       });
     }
   }
@@ -939,6 +1018,8 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     'Rank (Total Cost)','Best of Product','Lowest APR','Highest APR',
     'No Cost Rank','No Cost Loan Option','3-Year Costs','Rank 3-Year','3-Year Winner',
     'Monthly Escrow','DTI',
+    '', // spacer
+    'Cost to Par','Interest vs Par','Return vs Par','Total Monthly (Full)',
   ];
 
   const sheetData = [exportCols];
@@ -1218,6 +1299,9 @@ async function runPricing(client, scenario) {
     fees_in: scenario.fees_in || false,
     origination_fee: Number(scenario.origination_fee) || 0,
     loan_amount: scenario.loan_amount || 0,
+    til_years: scenario._til_years || 4.25,
+    escrow_annual_rate: Number(scenario._escrow_annual_rate) || 1.25,
+    property_value: scenario.property_value || 0,
   });
   return {
     results: ranked, errors,
@@ -1370,17 +1454,11 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                 <span className="rate">{parRate.pricing.base_rate_percent.toFixed(3)}%</span>
                 <span className="detail">par rate</span>
                 <span className="detail">|</span>
-                <span className="detail">${parRate.pricing.monthly_pi.toLocaleString()}/mo P&I</span>
-                {parRate.pricing.government_insurance?.type !== "none" && parRate.pricing.government_insurance?.monthly_amount > 0 && (
-                  <>
-                    <span className="detail">|</span>
-                    <span className="detail" style={{color:'var(--orange)'}}>${parRate.pricing.total_monthly_payment.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}/mo total</span>
-                  </>
-                )}
+                <span className="detail">${(parRate.analytics?.total_monthly_full || parRate.pricing.total_monthly_payment).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}/mo</span>
                 <span className="detail">|</span>
-                <span className="detail">{parRate.pricing.apr.toFixed(4)}% APR</span>
+                <span className="detail">{parRate.pricing.apr.toFixed(3)}% APR</span>
                 <span className="detail">|</span>
-                <span className="detail">Price: {(parRate.pricing.adjusted_final_price ?? parRate.pricing.final_price_points).toFixed(4)}</span>
+                <span className="detail">Price: {(parRate.pricing.adjusted_final_price ?? parRate.pricing.final_price_points).toFixed(3)}</span>
               </div>
             </div>
           )}
@@ -1453,50 +1531,62 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
             <thead>
               <tr>
                 <th>Rate</th>
-                <th>Base Price</th>
                 <th>Final Price</th>
-                <th>Monthly P&I</th>
-                {first.pricing.government_insurance?.type !== "none" && first.pricing.government_insurance?.monthly_amount > 0 && <th>Total Payment</th>}
+                <th>Cost to Par</th>
+                <th>Total Monthly</th>
+                <th title="Cumulative interest + MI savings (or cost) vs par rate over Time in Loan">Interest vs Par</th>
+                <th title="Net benefit as % of incremental upfront cost vs par. Positive = good deal.">Return</th>
                 <th>APR</th>
-                <th>Points Cost</th>
-                <th>Type</th>
               </tr>
             </thead>
             <tbody>
               {displayed.map((r, i) => {
-                // Use adjusted_final_price (accounts for fees-in) for display
                 const afp = r.pricing.adjusted_final_price ?? r.pricing.final_price_points;
-                // Discount points in dollars based on adjusted price
-                const dpDollars = Math.round(((100 - afp) / 100) * (loanAmount || 350000));
+                const a = r.analytics || {};
+                const ctp = a.cost_to_par || 0;
+                const ivp = a.interest_vs_par || 0;
+                const ret = a.two_year_return;
+                const totalMo = a.total_monthly_full || r.pricing.total_monthly_payment;
 
                 const sortedIdx = sorted.indexOf(r);
                 const isSelected = selectedRateIdx === sortedIdx;
+
+                // Return display: cap at ±999%, show PAR for par row, — for noise
+                let retDisplay = '—';
+                let retColor = 'var(--text3)';
+                if (r.is_par_rate) {
+                  retDisplay = 'PAR';
+                  retColor = 'var(--green)';
+                } else if (ret !== null && ret !== undefined) {
+                  const retPct = Math.round(ret * 100);
+                  const capped = Math.min(999, Math.max(-999, retPct));
+                  retDisplay = (capped >= 0 ? '+' : '') + capped + '%';
+                  retColor = capped > 10 ? 'var(--green)' : capped < -10 ? 'var(--red)' : 'var(--text2)';
+                }
 
                 return (
                   <tr key={i} className={r.is_par_rate ? 'par-row' : ''} onClick={() => setSelectedRateIdx(isSelected ? null : sortedIdx)}
                       style={{cursor:'pointer', outline: isSelected ? '1px solid var(--accent)' : 'none'}}>
                     <td style={{fontWeight: r.is_par_rate ? 700 : 400}}>
                       {r.pricing.base_rate_percent.toFixed(3)}%
+                      {r.is_par_rate && <span className="par-badge" style={{marginLeft:6}}>PAR</span>}
                     </td>
-                    <td>{r.pricing.base_price_points.toFixed(4)}</td>
                     <td style={{color: afp < 99.9 ? 'var(--red)' : afp > 100.1 ? 'var(--green)' : 'var(--text)'}}>
-                      {afp.toFixed(4)}
+                      {afp.toFixed(3)}
                     </td>
-                    <td>${r.pricing.monthly_pi.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
-                    {first.pricing.government_insurance?.type !== "none" && first.pricing.government_insurance?.monthly_amount > 0 && (
-                      <td style={{fontWeight:600, color:'var(--orange)'}}>
-                        ${r.pricing.total_monthly_payment.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}
-                      </td>
-                    )}
-                    <td>{r.pricing.apr.toFixed(4)}%</td>
-                    <td style={{color: dpDollars > 0 ? 'var(--red)' : dpDollars < 0 ? 'var(--green)' : 'var(--text2)'}}>
-                      {dpDollars > 0 ? `-$${dpDollars.toLocaleString()}` : dpDollars < 0 ? `+$${Math.abs(dpDollars).toLocaleString()}` : '$0'}
+                    <td style={{color: ctp > 50 ? 'var(--red)' : ctp < -50 ? 'var(--green)' : 'var(--text2)', fontWeight: r.is_par_rate ? 400 : 500}}>
+                      {r.is_par_rate ? '$0' : ctp > 0 ? '+$' + ctp.toLocaleString() : ctp < 0 ? '-$' + Math.abs(ctp).toLocaleString() : '$0'}
                     </td>
-                    <td>
-                      {r.is_par_rate && <span className="par-badge">PAR</span>}
-                      {r.rate_option === "below_par" && !r.is_par_rate && <span className="discount-badge">discount</span>}
-                      {r.rate_option === "above_par" && <span className="credit-badge">credit</span>}
+                    <td style={{fontWeight: 500}}>
+                      ${totalMo.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}
                     </td>
+                    <td style={{color: ivp < -50 ? 'var(--green)' : ivp > 50 ? 'var(--red)' : 'var(--text2)'}}>
+                      {r.is_par_rate ? '$0' : ivp < 0 ? '-$' + Math.abs(ivp).toLocaleString() : ivp > 0 ? '+$' + ivp.toLocaleString() : '$0'}
+                    </td>
+                    <td style={{color: retColor, fontWeight: (ret !== null && Math.abs(ret * 100) > 15) || r.is_par_rate ? 600 : 400}}>
+                      {retDisplay}
+                    </td>
+                    <td>{r.pricing.apr.toFixed(3)}%</td>
                   </tr>
                 );
               })}
@@ -1664,6 +1754,9 @@ function App() {
       is_ami_below_100: autoAmiBelow100,
       is_first_va_use: form.is_first_va_use,
       is_va_funding_fee_exempt: form.is_va_funding_fee_exempt,
+      // Analytics metadata (passed through to rankResults, not used by PPE engine)
+      _til_years: getEffectiveTimeInLoan(form),
+      _escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
     };
 
     const { errors, resolved } = validateAndResolve(scenario);
