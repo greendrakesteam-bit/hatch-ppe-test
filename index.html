@@ -662,6 +662,9 @@ function rankResults(results, opts) {
   const escrowRate = opts?.escrow_annual_rate || 1.25;
   const propertyValue = opts?.property_value || 0;
   const monthlyEscrow = Math.round(propertyValue * (escrowRate / 100) / 12);
+  const monthlyIncome = (opts?.monthly_income || 0);
+  const additionalDebt = opts?.additional_debt || 0;
+  const maxDTI = opts?.max_dti || 0.50;
 
   const eligible = results.filter(r => r.eligibility.is_eligible);
   const ineligible = results.filter(r => !r.eligibility.is_eligible);
@@ -752,6 +755,12 @@ function rankResults(results, opts) {
       // Total monthly including escrow
       const totalMonthlyFull = r.pricing.total_monthly_payment + monthlyEscrow;
 
+      // DTI calculation: (housing + escrow + other debt) / gross monthly income
+      const dti = monthlyIncome > 0
+        ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome
+        : 0;
+      const dtiEligible = monthlyIncome <= 0 || dti <= maxDTI;
+
       // Attach analytics to result object
       r.analytics = {
         cost_to_par: Math.round(costToPar),
@@ -759,6 +768,8 @@ function rankResults(results, opts) {
         two_year_return: twoYearReturn,
         total_monthly_full: Math.round(totalMonthlyFull * 100) / 100,
         monthly_savings_vs_par: Math.round((parTotalMonthly - totalMonthlyFull) * 100) / 100,
+        dti: Math.round(dti * 10000) / 10000,
+        dti_eligible: dtiEligible,
       };
     }
 
@@ -813,6 +824,146 @@ function cumipmt(annualRatePercent, totalPeriods, pv, startPeriod, endPeriod) {
     balance -= principal;
   }
   return totalInterest;
+}
+
+// =============================================
+// REFI LOAN AMOUNT OPTIMIZER
+// =============================================
+// Solves: what loan amount covers closing costs + desired cash back
+// while staying below the next LTV price break and under DTI limit?
+//
+// Key insight: within the same LTV band, price (in points) doesn't change,
+// so we can solve algebraically without re-querying Supabase.
+//
+// L = (payoff + fixedCosts + cashBack) / (price/100 - pctCostRate)
+// where pctCostRate = percentage-based closing cost rate (e.g. 0.015)
+//
+// Then cap at: min(L_algebraic, L_ltv_ceiling, L_dti_ceiling)
+
+const STANDARD_LTV_BREAKS = [60, 65, 70, 75, 80, 85, 90, 95, 97];
+
+function getNextLTVBreak(currentLTV) {
+  // Find the next LTV price break ABOVE current LTV
+  for (const brk of STANDARD_LTV_BREAKS) {
+    if (brk > currentLTV) return brk;
+  }
+  return 100; // fallback
+}
+
+function solveOptimalLoan(rateResult, params) {
+  const {
+    payoff_balance,       // existing loan payoff amount
+    property_value,       // appraised/market value
+    desired_cash_back = 200,  // target cash to borrower at closing (FNMA max 1% on R/T refi)
+    max_ltv_break,        // next LTV break to stay under (e.g. 70)
+    origination_fee = 1500,
+    fees_in = false,
+    closing_cost_pct = 0.015,  // placeholder 1.5% of loan for title/recording/etc
+    monthly_income = 0,
+    additional_debt = 0,
+    escrow_monthly = 0,
+    max_dti = 0.50,
+  } = params;
+
+  const p = rateResult.pricing;
+  const afp = p.adjusted_final_price ?? p.final_price_points;
+  const ratePercent = p.base_rate_percent;
+  const termMo = rateResult.term_months;
+  const miMonthly = p.government_insurance?.monthly_amount || 0;
+  const upfrontMI = p.government_insurance?.upfront_fee_amount || 0;
+  const upfrontMIPct = p.government_insurance?.upfront_fee_percent || 0;
+  const miFinanced = p.government_insurance?.upfront_financed || false;
+
+  // LTV ceiling: stay just under the price break
+  const ltvCeiling = (max_ltv_break - 0.01) / 100; // e.g. 69.99%
+  const maxLoanLTV = Math.floor(property_value * ltvCeiling);
+
+  // DTI ceiling: max loan where payment stays under DTI limit
+  let maxLoanDTI = Infinity;
+  if (monthly_income > 0) {
+    // max_housing = max_dti * monthly_income - additional_debt - escrow
+    const maxHousing = max_dti * monthly_income - additional_debt - escrow_monthly;
+    const maxPI = Math.max(0, maxHousing - miMonthly);
+    if (maxPI > 0) {
+      // Reverse P&I formula: L = PI * ((1+r)^n - 1) / (r * (1+r)^n)
+      const r = ratePercent / 100 / 12;
+      if (r > 0 && termMo > 0) {
+        const factor = (Math.pow(1 + r, termMo) - 1) / (r * Math.pow(1 + r, termMo));
+        let baseLoan = maxPI * factor;
+        // If MI is financed (FHA/VA), the total loan = base * (1 + upfront_pct)
+        // So base = total / (1 + upfront_pct), and total loan that fits is baseLoan
+        if (miFinanced && upfrontMIPct > 0) {
+          baseLoan = baseLoan / (1 + upfrontMIPct / 100);
+        }
+        maxLoanDTI = Math.floor(baseLoan);
+      }
+    } else {
+      maxLoanDTI = payoff_balance; // can't increase at all
+    }
+  }
+
+  // Algebraic solution: L = (payoff + fixedCosts + cashBack) / (price/100 - pctCostRate)
+  // Fixed costs: origination fee (if fees-out), upfront MI (if not financed)
+  const fixedCosts = (fees_in ? 0 : origination_fee) + (miFinanced ? 0 : upfrontMI);
+  const numerator = payoff_balance + fixedCosts + desired_cash_back;
+
+  // Points/credits: (price/100) of loan goes toward/against costs
+  // Closing costs: closing_cost_pct of loan
+  // If fees-in, origination fee is also baked into price, effectively reducing price
+  // The adjusted_final_price already accounts for fees-in adjustment
+  const priceAsDecimal = afp / 100;  // e.g. 0.993573
+  const denominator = priceAsDecimal - closing_cost_pct;  // net % of loan available after costs
+
+  let solvedLoan;
+  if (denominator <= 0) {
+    // Price is so low that costs exceed loan proceeds — can't cover costs
+    solvedLoan = payoff_balance; // no increase possible
+  } else {
+    solvedLoan = Math.ceil(numerator / denominator);
+  }
+
+  // If MI is financed, the solved loan doesn't include the financed upfront fee
+  // The total loan to Supabase would be solvedLoan * (1 + upfrontMIPct/100)
+  // For LTV purposes, we use the BASE loan amount (before financed MI)
+
+  // Apply ceilings
+  const optimalLoan = Math.min(solvedLoan, maxLoanLTV, maxLoanDTI);
+
+  // Determine which constraint binds
+  let binding_constraint = 'costs'; // algebraic solution fits
+  if (optimalLoan === maxLoanLTV && solvedLoan > maxLoanLTV) binding_constraint = 'ltv';
+  if (optimalLoan === maxLoanDTI && solvedLoan > maxLoanDTI) binding_constraint = 'dti';
+
+  // Compute actual cash to borrower at the optimal loan amount
+  const totalLoanWithMI = miFinanced ? optimalLoan * (1 + upfrontMIPct / 100) : optimalLoan;
+  const pointsCost = ((100 - afp) / 100) * totalLoanWithMI; // + = borrower pays, - = credit
+  const closingCosts = optimalLoan * closing_cost_pct;
+  const uwFee = fees_in ? 0 : origination_fee;
+  const upfrontMICost = miFinanced ? 0 : upfrontMI; // if financed, already in totalLoan
+  const totalCosts = pointsCost + closingCosts + uwFee + upfrontMICost;
+  const proceedsAfterPayoff = optimalLoan - payoff_balance; // money freed up
+  const cashToBorrower = Math.round(proceedsAfterPayoff - totalCosts);
+
+  // Verify DTI at optimal loan
+  const optPI = monthlyPI(totalLoanWithMI, ratePercent, termMo);
+  const optTotalMonthly = optPI + miMonthly + escrow_monthly;
+  const optDTI = monthly_income > 0 ? (optTotalMonthly + additional_debt) / monthly_income : 0;
+  const optLTV = (optimalLoan / property_value) * 100;
+
+  return {
+    original_loan: payoff_balance,
+    optimal_loan: optimalLoan,
+    loan_increase: optimalLoan - payoff_balance,
+    cash_to_borrower: cashToBorrower,
+    binding_constraint,  // 'costs' | 'ltv' | 'dti'
+    optimal_ltv: Math.round(optLTV * 100) / 100,
+    optimal_dti: Math.round(optDTI * 10000) / 10000,
+    max_loan_ltv: maxLoanLTV,
+    max_loan_dti: maxLoanDTI === Infinity ? null : maxLoanDTI,
+    solved_loan_uncapped: solvedLoan,
+    total_monthly: Math.round(optTotalMonthly * 100) / 100,
+    monthly_pi: optPI,
+  };
 }
 
 // --- Auto Time in Loan (years) ---
@@ -942,6 +1093,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
         'Interest vs Par': r.analytics?.interest_vs_par || 0,
         'Return vs Par': r.analytics?.two_year_return !== null && r.analytics?.two_year_return !== undefined ? Math.round(r.analytics.two_year_return * 10000) / 10000 : '',
         'Total Monthly (Full)': r.analytics?.total_monthly_full || 0,
+        'DTI Eligible': r.analytics?.dti_eligible !== false ? 'Y' : 'N',
       });
     }
   }
@@ -1019,7 +1171,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     'No Cost Rank','No Cost Loan Option','3-Year Costs','Rank 3-Year','3-Year Winner',
     'Monthly Escrow','DTI',
     '', // spacer
-    'Cost to Par','Interest vs Par','Return vs Par','Total Monthly (Full)',
+    'Cost to Par','Interest vs Par','Return vs Par','Total Monthly (Full)','DTI Eligible',
   ];
 
   const sheetData = [exportCols];
@@ -1302,6 +1454,9 @@ async function runPricing(client, scenario) {
     til_years: scenario._til_years || 4.25,
     escrow_annual_rate: Number(scenario._escrow_annual_rate) || 1.25,
     property_value: scenario.property_value || 0,
+    monthly_income: scenario._monthly_income || 0,
+    additional_debt: scenario._additional_debt || 0,
+    max_dti: 0.50,
   });
   return {
     results: ranked, errors,
@@ -1417,16 +1572,27 @@ function LoanSummary({ summary }) {
   );
 }
 
-function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayOpts }) {
+function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayOpts, optimizerParams }) {
   const first = group[0];
   const parRate = group.find(r => r.is_par_rate);
   const sorted = [...group].sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
-  const displayed = showAll ? sorted : sorted.slice(0, 7);
-  const hasMore = sorted.length > 7;
 
   const [expanded, setExpanded] = useState(true);
   const [showLLPA, setShowLLPA] = useState(false);
   const [selectedRateIdx, setSelectedRateIdx] = useState(null); // index into sorted array
+  const [hideDTIIneligible, setHideDTIIneligible] = useState(true); // default: hide DTI-ineligible
+
+  // DTI eligibility counts
+  const dtiEligibleCount = sorted.filter(r => r.analytics?.dti_eligible !== false).length;
+  const dtiIneligibleCount = sorted.length - dtiEligibleCount;
+  const hasDTIFilter = dtiIneligibleCount > 0;
+
+  // Filter displayed rates by DTI eligibility
+  const dtiFiltered = hideDTIIneligible && hasDTIFilter
+    ? sorted.filter(r => r.analytics?.dti_eligible !== false)
+    : sorted;
+  const displayed = showAll ? dtiFiltered : dtiFiltered.slice(0, 7);
+  const hasMore = dtiFiltered.length > 7;
 
   // Which rate to show summary for: selected or par rate
   const summaryRate = selectedRateIdx !== null ? sorted[selectedRateIdx] : parRate;
@@ -1441,7 +1607,9 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
         </div>
         <div className="product-badges">
           <span className="product-category">{first.product_category}</span>
-          <span style={{fontSize:11, color:'var(--text3)'}}>{group.length} rates</span>
+          <span style={{fontSize:11, color:'var(--text3)'}}>
+            {hasDTIFilter ? `${dtiEligibleCount}/${group.length} DTI-eligible` : `${group.length} rates`}
+          </span>
           <span style={{fontSize:14, color:'var(--text3)'}}>{expanded ? '▾' : '▸'}</span>
         </div>
       </div>
@@ -1470,6 +1638,11 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
             {first.llpa_breakdown.length > 0 && (
               <span style={{marginLeft:8, color:'var(--accent)', cursor:'pointer', fontSize:11}} onClick={(e) => { e.stopPropagation(); setShowLLPA(!showLLPA); }}>
                 [{showLLPA ? 'hide' : 'show'} breakdown]
+              </span>
+            )}
+            {hasDTIFilter && (
+              <span style={{marginLeft:8, color: hideDTIIneligible ? 'var(--green)' : 'var(--yellow)', cursor:'pointer', fontSize:11}} onClick={(e) => { e.stopPropagation(); setHideDTIIneligible(!hideDTIIneligible); }}>
+                [{hideDTIIneligible ? `show ${dtiIneligibleCount} DTI-ineligible` : 'hide DTI-ineligible'}]
               </span>
             )}
           </div>
@@ -1537,6 +1710,8 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                 <th title="Cumulative interest + MI savings (or cost) vs par rate over Time in Loan">Interest vs Par</th>
                 <th title="Net benefit as % of incremental upfront cost vs par. Positive = good deal.">Return</th>
                 <th>APR</th>
+                {optimizerParams && <th title="Optimized loan amount covering closing costs up to LTV ceiling">Opt. Loan</th>}
+                {optimizerParams && <th title="Cash to borrower at closing with optimized loan amount">Cash Back</th>}
               </tr>
             </thead>
             <tbody>
@@ -1550,6 +1725,10 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
 
                 const sortedIdx = sorted.indexOf(r);
                 const isSelected = selectedRateIdx === sortedIdx;
+                const isDTIFail = a.dti_eligible === false;
+
+                // Optimizer solve per rate
+                const opt = optimizerParams ? solveOptimalLoan(r, optimizerParams) : null;
 
                 // Return display: cap at ±999%, show PAR for par row, — for noise
                 let retDisplay = '—';
@@ -1566,10 +1745,11 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
 
                 return (
                   <tr key={i} className={r.is_par_rate ? 'par-row' : ''} onClick={() => setSelectedRateIdx(isSelected ? null : sortedIdx)}
-                      style={{cursor:'pointer', outline: isSelected ? '1px solid var(--accent)' : 'none'}}>
+                      style={{cursor:'pointer', outline: isSelected ? '1px solid var(--accent)' : 'none', opacity: isDTIFail ? 0.35 : 1}}>
                     <td style={{fontWeight: r.is_par_rate ? 700 : 400}}>
                       {r.pricing.base_rate_percent.toFixed(3)}%
                       {r.is_par_rate && <span className="par-badge" style={{marginLeft:6}}>PAR</span>}
+                      {isDTIFail && <span style={{fontSize:9, color:'var(--red)', marginLeft:4}}>DTI</span>}
                     </td>
                     <td style={{color: afp < 99.9 ? 'var(--red)' : afp > 100.1 ? 'var(--green)' : 'var(--text)'}}>
                       {afp.toFixed(3)}
@@ -1587,6 +1767,20 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                       {retDisplay}
                     </td>
                     <td>{r.pricing.apr.toFixed(3)}%</td>
+                    {opt && (
+                      <td style={{fontSize:11}}>
+                        <span style={{color: opt.optimal_loan > opt.original_loan ? 'var(--accent)' : 'var(--text2)'}}>
+                          ${(opt.optimal_loan / 1000).toFixed(1)}K
+                        </span>
+                        {opt.binding_constraint === 'ltv' && <span style={{fontSize:8, color:'var(--yellow)', marginLeft:2}} title="Capped by LTV ceiling">LTV</span>}
+                        {opt.binding_constraint === 'dti' && <span style={{fontSize:8, color:'var(--red)', marginLeft:2}} title="Capped by DTI limit">DTI</span>}
+                      </td>
+                    )}
+                    {opt && (
+                      <td style={{color: opt.cash_to_borrower > 0 ? 'var(--green)' : opt.cash_to_borrower < -100 ? 'var(--red)' : 'var(--text2)', fontSize:11, fontWeight: opt.cash_to_borrower > 0 ? 600 : 400}}>
+                        {opt.cash_to_borrower >= 0 ? '+$' + opt.cash_to_borrower.toLocaleString() : '-$' + Math.abs(opt.cash_to_borrower).toLocaleString()}
+                      </td>
+                    )}
                   </tr>
                 );
               })}
@@ -1657,6 +1851,10 @@ function App() {
     // Analysis options
     time_in_loan_override: '',    // Manual override for time in loan (years). Empty = auto-calculate.
     excluded_products: 'FHA30_203K', // Comma-separated product codes to hide from results & downloads
+    // Refi optimizer
+    refi_optimize: false,         // Enable loan amount optimization for refis
+    payoff_balance: '',           // Existing mortgage payoff balance ($) — base for loan increase
+    desired_cash_back: 200,       // Target cash to borrower at closing ($)
   });
 
   const updateForm = (field, value) => setForm(prev => ({...prev, [field]: value}));
@@ -1757,6 +1955,8 @@ function App() {
       // Analytics metadata (passed through to rankResults, not used by PPE engine)
       _til_years: getEffectiveTimeInLoan(form),
       _escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
+      _monthly_income: (Number(form.borrower_income) || 0) / 12,
+      _additional_debt: Number(form.additional_debt_service) || 0,
     };
 
     const { errors, resolved } = validateAndResolve(scenario);
@@ -2145,7 +2345,53 @@ function App() {
             );
           })()}
 
-          {/* === 9. HIDDEN SECTION — less common inputs === */}
+          {/* === 9. REFI OPTIMIZER === */}
+          {(form.purpose === 'rate_term_refi' || form.purpose === 'cash_out_refi') && (
+            <div className="form-section" style={{background:'rgba(56,189,248,0.05)', borderRadius:6, padding:10, border:'1px solid var(--bg3)'}}>
+              <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:6}}>
+                <h3 style={{margin:0}}>Refi Optimizer</h3>
+                <label style={{display:'flex', alignItems:'center', gap:4, fontSize:11, color:'var(--text2)', cursor:'pointer'}}>
+                  <input type="checkbox" checked={form.refi_optimize} onChange={e => updateForm('refi_optimize', e.target.checked)} />
+                  Enable
+                </label>
+              </div>
+              {form.refi_optimize && (
+                <>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label>Payoff Balance ($)</label>
+                      <input type="text" value={form.payoff_balance ? formatCurrency(form.payoff_balance) : ''} onChange={e => updateForm('payoff_balance', parseCurrency(e.target.value) || '')} placeholder="Existing mortgage payoff" />
+                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Current mortgage payoff amount</div>
+                    </div>
+                  </div>
+                  <div className="form-row">
+                    <div className="form-group" style={{flex:1}}>
+                      <label>Target Cash Back ($)</label>
+                      <input type="number" value={form.desired_cash_back} onChange={e => updateForm('desired_cash_back', Number(e.target.value))} style={{width:'100%'}} />
+                    </div>
+                    <div className="form-group" style={{flex:1}}>
+                      <label>Max LTV Break (%)</label>
+                      <input type="number" value={(() => {
+                        const ltv = Number(form.loan_amount) / Number(form.property_value) * 100;
+                        return getNextLTVBreak(ltv);
+                      })()} disabled style={{width:'100%', opacity:0.6}} />
+                      <div style={{fontSize:10, color:'var(--text3)', marginTop:2}}>Auto-detected</div>
+                    </div>
+                  </div>
+                  {Number(form.payoff_balance) > 0 && (
+                    <div style={{fontSize:11, color:'var(--accent)', marginTop:4, padding:'4px 8px', background:'var(--bg)', borderRadius:4}}>
+                      LTV ceiling: {((getNextLTVBreak(Number(form.loan_amount) / Number(form.property_value) * 100) - 0.01)).toFixed(2)}%
+                      {' = $'}{Math.floor(Number(form.property_value) * (getNextLTVBreak(Number(form.loan_amount) / Number(form.property_value) * 100) - 0.01) / 100).toLocaleString()}
+                      {' · '}
+                      Headroom: ${ (Math.floor(Number(form.property_value) * (getNextLTVBreak(Number(form.loan_amount) / Number(form.property_value) * 100) - 0.01) / 100) - Number(form.payoff_balance)).toLocaleString()}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* === 10. HIDDEN SECTION — less common inputs === */}
           <div className="form-section" style={{marginTop:8}}>
             <div
               style={{fontSize:11, color:'var(--text3)', cursor:'pointer', display:'flex', alignItems:'center', gap:6}}
@@ -2313,6 +2559,19 @@ function App() {
                     origination_fee: Number(form.origination_fee) || 0,
                     escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
                   }}
+                  optimizerParams={form.refi_optimize && Number(form.payoff_balance) > 0 ? {
+                    payoff_balance: Number(form.payoff_balance),
+                    property_value: Number(form.property_value),
+                    desired_cash_back: Number(form.desired_cash_back) || 200,
+                    max_ltv_break: getNextLTVBreak(Number(form.loan_amount) / Number(form.property_value) * 100),
+                    origination_fee: Number(form.origination_fee) || 1500,
+                    fees_in: form.fees_in,
+                    closing_cost_pct: 0.015,
+                    monthly_income: (Number(form.borrower_income) || 0) / 12,
+                    additional_debt: Number(form.additional_debt_service) || 0,
+                    escrow_monthly: Math.round(Number(form.property_value) * (Number(form.escrow_annual_rate) || 1.25) / 100 / 12),
+                    max_dti: 0.50,
+                  } : null}
                 />
               ))}
 
