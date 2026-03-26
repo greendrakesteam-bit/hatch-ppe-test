@@ -528,14 +528,15 @@ function calcLoanSummary(rateOption, scenario, opts) {
   const p = rateOption.pricing;
   const gi = p.government_insurance || { type: "none", upfront_fee_amount: 0, upfront_financed: false, monthly_amount: 0 };
   const feesIn = opts.fees_in || false;
-  const origFee = opts.origination_fee || 0;
+  // Use per-result investor fee instead of global origination_fee
+  const invFee = p.investor_fee_amount || 0;
   const escrowAnnualRate = opts.escrow_annual_rate || 1.25;
 
   // --- Fees-in adjustment ---
-  // When fees-in: origination fee is converted to points and subtracted from price
+  // When fees-in: investor fee is converted to points and subtracted from price
   // This effectively shifts the par rate up (rates look higher, but no separate fee line item)
-  const origFeePoints = scenario.loan_amount > 0 ? (origFee / scenario.loan_amount) * 100 : 0;
-  const adjustedFinalPrice = feesIn ? p.final_price_points - origFeePoints : p.final_price_points;
+  const invFeePoints = scenario.loan_amount > 0 ? (invFee / scenario.loan_amount) * 100 : 0;
+  const adjustedFinalPrice = feesIn ? p.final_price_points - invFeePoints : p.final_price_points;
 
   // --- Cost of Interest Rate (discount points in dollars) ---
   // Below 100 = borrower pays points (cost), Above 100 = borrower gets credit
@@ -546,7 +547,7 @@ function calcLoanSummary(rateOption, scenario, opts) {
 
   // --- Other Lender Costs (proc + UW) ---
   // Fees-out: shown as line item. Fees-in: $0 (already baked into price).
-  const otherLenderCosts = feesIn ? 0 : origFee;
+  const otherLenderCosts = feesIn ? 0 : invFee;
 
   // --- Total Lender Costs (or Credits) ---
   const totalLenderCosts = costOfRate + costOfMI + otherLenderCosts;
@@ -601,11 +602,63 @@ function calcLoanSummary(rateOption, scenario, opts) {
 
 // --- Pricing math ---
 function calculateComp(loanAmount, config) {
-  if (!config.comp_percent) return { comp_dollars: 0, comp_points: 0 };
+  if (!config.comp_percent) return { comp_dollars: 0, comp_points: 0, margin_adjustment_dollars: 0 };
   let dollars = loanAmount * config.comp_percent;
   if (config.comp_floor_percent != null) dollars = Math.max(config.comp_floor_percent, dollars);
   if (config.comp_ceiling_percent != null) dollars = Math.min(config.comp_ceiling_percent, dollars);
-  return { comp_dollars: dollars, comp_points: (dollars / loanAmount) * 100 };
+  return { comp_dollars: dollars, comp_points: (dollars / loanAmount) * 100, margin_adjustment_dollars: 0 };
+}
+
+// Enhanced comp: per-product comp overrides investor-level, plus margin adjustments (post-cap)
+function calculateCompEnhanced(loanAmount, config, productComp, marginAdjustments, scenario) {
+  // Resolve comp structure: per-product overrides investor-level
+  const comp_pct = productComp?.comp_percent ?? config.comp_percent;
+  const comp_floor = productComp?.comp_floor_dollars ?? config.comp_floor_percent;
+  const comp_ceiling = productComp?.comp_ceiling_dollars ?? config.comp_ceiling_percent;
+
+  if (!comp_pct || comp_pct === 0) {
+    return { comp_dollars: 0, comp_points: 0, margin_adjustment_dollars: 0 };
+  }
+
+  let comp_dollars = loanAmount * comp_pct;
+
+  // Apply floor
+  if (comp_floor !== null && comp_floor !== undefined) {
+    comp_dollars = Math.max(comp_floor, comp_dollars);
+  }
+
+  // Apply ceiling
+  if (comp_ceiling !== null && comp_ceiling !== undefined) {
+    comp_dollars = Math.min(comp_ceiling, comp_dollars);
+  }
+
+  // Apply margin adjustments (post-cap, can push above ceiling)
+  let margin_adjustment_dollars = 0;
+  for (const adj of (marginAdjustments || [])) {
+    let triggered = false;
+    switch (adj.adjustment_trigger) {
+      case "is_self_employed":
+        triggered = scenario.is_self_employed === (adj.trigger_value === "true") || scenario.self_employed === (adj.trigger_value === "true");
+        break;
+      case "property_type":
+        triggered = scenario.property_type === adj.trigger_value;
+        break;
+      case "subordination":
+        triggered = scenario.subordination === (adj.trigger_value === "true");
+        break;
+      case "amortization":
+        triggered = scenario.amortization === adj.trigger_value;
+        break;
+    }
+    if (triggered) {
+      margin_adjustment_dollars += adj.adjustment_dollars;
+    }
+  }
+
+  comp_dollars += margin_adjustment_dollars;
+  const comp_points = (comp_dollars / loanAmount) * 100;
+
+  return { comp_dollars, comp_points, margin_adjustment_dollars };
 }
 
 function monthlyPI(amount, rate, months) {
@@ -654,9 +707,7 @@ function calcAPR(loanAmount, ratePercent, pricePoints, termMonths) {
 // --- Ranking ---
 function rankResults(results, opts) {
   const feesIn = opts?.fees_in || false;
-  const origFee = opts?.origination_fee || 0;
   const loanAmt = opts?.loan_amount || 0;
-  const origFeePoints = (feesIn && loanAmt > 0) ? (origFee / loanAmt) * 100 : 0;
   const tilYears = opts?.til_years || 4.25;
   const tilMonths = Math.round(tilYears * 12);
   const escrowRate = opts?.escrow_annual_rate || 1.25;
@@ -670,11 +721,13 @@ function rankResults(results, opts) {
   const ineligible = results.filter(r => !r.eligibility.is_eligible);
 
   // Compute adjusted_final_price on every eligible result
-  // Fees-in: origination fee converted to points and subtracted from price
+  // Fees-in: investor fee (per-result) converted to points and subtracted from price
   // Fees-out: adjusted = raw (no change)
   for (const r of eligible) {
+    const invFee = r.pricing.investor_fee_amount || 0;
+    const invFeePoints = (feesIn && loanAmt > 0) ? (invFee / loanAmt) * 100 : 0;
     r.pricing.adjusted_final_price = feesIn
-      ? r.pricing.final_price_points - origFeePoints
+      ? r.pricing.final_price_points - invFeePoints
       : r.pricing.final_price_points;
   }
 
@@ -708,10 +761,10 @@ function rankResults(results, opts) {
     const parTermMo = parR.term_months;
     // Par upfront cost (points/credits in dollars using adjusted price)
     const parPointsDollars = ((100 - parAfp) / 100) * parTotalLoan;
-    const uwFee = feesIn ? 0 : origFee;
+    const parInvFee = feesIn ? 0 : (parR.pricing.investor_fee_amount || 0);
     const parUpfrontMI = parR.pricing.government_insurance?.upfront_fee_amount || 0;
     const parEstClosing = parR.pricing.estimated_closing_costs || 0;
-    const parTotalUpfront = parPointsDollars + uwFee + parUpfrontMI + parEstClosing;
+    const parTotalUpfront = parPointsDollars + parInvFee + parUpfrontMI + parEstClosing;
     // Par interest over TIL
     const parInterestTIL = cumipmt(parRate, parTermMo, parTotalLoan, 1, tilMonths);
     // Par MI over TIL
@@ -734,7 +787,8 @@ function rankResults(results, opts) {
 
       // Points/credits in dollars for this rate
       const pointsDollars = ((100 - afp) / 100) * totalLoan;
-      const totalUpfront = pointsDollars + uwFee + upfrontMI + estClosing;
+      const rInvFee = feesIn ? 0 : (r.pricing.investor_fee_amount || 0);
+      const totalUpfront = pointsDollars + rInvFee + upfrontMI + estClosing;
 
       // Cost to Par = this rate's total upfront minus par's total upfront
       // Positive = costs more upfront than par. Negative = lender credit vs par.
@@ -856,7 +910,7 @@ function solveOptimalLoan(rateResult, params) {
     property_value,       // appraised/market value
     desired_cash_back = 200,  // target cash to borrower at closing (FNMA max 1% on R/T refi)
     max_ltv_break,        // next LTV break to stay under (e.g. 70)
-    origination_fee = 1500,
+    origination_fee = null,  // DEPRECATED — now uses per-result investor_fee_amount
     fees_in = false,
     closing_cost_pct = 0.015,  // placeholder 1.5% of loan for title/recording/etc
     monthly_income = 0,
@@ -903,8 +957,9 @@ function solveOptimalLoan(rateResult, params) {
   }
 
   // Algebraic solution: L = (payoff + fixedCosts + cashBack) / (price/100 - pctCostRate)
-  // Fixed costs: origination fee (if fees-out), upfront MI (if not financed)
-  const fixedCosts = (fees_in ? 0 : origination_fee) + (miFinanced ? 0 : upfrontMI);
+  // Fixed costs: investor fee (if fees-out), upfront MI (if not financed)
+  const invFeeForSolver = origination_fee ?? (p.investor_fee_amount || 0);
+  const fixedCosts = (fees_in ? 0 : invFeeForSolver) + (miFinanced ? 0 : upfrontMI);
   const numerator = payoff_balance + fixedCosts + desired_cash_back;
 
   // Points/credits: (price/100) of loan goes toward/against costs
@@ -938,7 +993,7 @@ function solveOptimalLoan(rateResult, params) {
   const totalLoanWithMI = miFinanced ? optimalLoan * (1 + upfrontMIPct / 100) : optimalLoan;
   const pointsCost = ((100 - afp) / 100) * totalLoanWithMI; // + = borrower pays, - = credit
   const closingCosts = optimalLoan * closing_cost_pct;
-  const uwFee = fees_in ? 0 : origination_fee;
+  const uwFee = fees_in ? 0 : invFeeForSolver;
   const upfrontMICost = miFinanced ? 0 : upfrontMI; // if financed, already in totalLoan
   const totalCosts = pointsCost + closingCosts + uwFee + upfrontMICost;
   const proceedsAfterPayoff = optimalLoan - payoff_balance; // money freed up
@@ -997,8 +1052,6 @@ function downloadPricingExcel(response, eligibleGroups, form) {
   const monthlyEscrow = Math.round((Number(form.property_value) || 0) * (Number(form.escrow_annual_rate) || 1.25) / 100 / 12);
   const monthlyIncome = (Number(form.borrower_income) || 0) / 12;
   const additionalDebt = Number(form.additional_debt_service) || 0;
-  const origFee = Number(form.origination_fee) || 1500;
-
   // --- Build flat list with analysis columns ---
   const allRows = [];
   for (const { group } of eligibleGroups) {
@@ -1019,8 +1072,8 @@ function downloadPricingExcel(response, eligibleGroups, form) {
       const pmiCost = monthlyMI * miMonths;
       // AC: Points/Credits — positive = borrower pays, negative = lender credit (uses adjusted price for fees-in)
       const pointsCredits = ((100 - finalPrice) / 100) * totalLoan;
-      // AD: Underwriting fee (fees-in: $0 because it's already baked into the adjusted price/points)
-      const uwFee = form.fees_in ? 0 : origFee;
+      // AD: Investor fee (fees-in: $0 because it's already baked into the adjusted price/points)
+      const uwFee = form.fees_in ? 0 : (r.pricing.investor_fee_amount || 0);
       // AE: Upfront MIP / Funding Fees
       const upfrontMipFf = upfrontFee;
       // AF: Other closing costs
@@ -1072,7 +1125,8 @@ function downloadPricingExcel(response, eligibleGroups, form) {
         'Interest': Math.round(interest * 100) / 100,
         'PMI/MIP': Math.round(pmiCost * 100) / 100,
         'Points/Credits': Math.round(pointsCredits * 100) / 100,
-        'Underwriting Fee': uwFee,
+        'Investor Fee': uwFee,
+        'Investor Fee Name': r.pricing.investor_fee_name || '',
         'Upfront MIP/Funding Fees': Math.round(upfrontMipFf * 100) / 100,
         'Other Closing Costs': otherClosing,
         'Total Upfront Costs': Math.round(totalUpfront * 100) / 100,
@@ -1270,7 +1324,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     { 'Field': 'Escrow Waiver', 'Value': form.escrow_waiver },
     { 'Field': 'Sub Lien Balance', 'Value': form.subordinate_lien_balance || 0 },
     { 'Field': 'HELOC Limit', 'Value': form.heloc_credit_limit || 0 },
-    { 'Field': 'Origination Fee', 'Value': form.origination_fee },
+    { 'Field': 'Investor Fee', 'Value': 'Per-product (from database)' },
     { 'Field': 'Fees In', 'Value': form.fees_in ? 'Yes' : 'No' },
     { 'Field': 'Escrow Annual Rate %', 'Value': form.escrow_annual_rate },
     { 'Field': 'Time in Loan (years)', 'Value': tilYears },
@@ -1338,13 +1392,32 @@ async function runPricing(client, scenario) {
         .select("*").eq("investor_id", inv.id).eq("channel", inv.channel).limit(1).single();
       if (!config) { errors.push(`No config: ${inv.code}`); continue; }
 
-      // Products
+      // Products (now includes per-product comp columns)
       const { data: products } = await client.from("investor_products")
         .select(`id, investor_id, product_id, investor_product_code, channel, is_available,
           min_fico, max_ltv_ratio, max_cltv_ratio, max_dti_ratio, state_availability, state_exclusions,
+          comp_percent, comp_floor_dollars, comp_ceiling_dollars,
           products(id, name, code, category, lien_position, amortization, term_months)`)
         .eq("investor_id", inv.id).eq("channel", inv.channel).eq("is_available", true);
       if (!products?.length) { errors.push(`No products: ${inv.code}`); continue; }
+
+      // Load margin adjustments for this investor/channel
+      let marginAdjustments = [];
+      try {
+        const { data: maData } = await client.from("margin_adjustments")
+          .select("id, investor_id, channel, adjustment_name, adjustment_trigger, trigger_value, adjustment_dollars")
+          .eq("investor_id", inv.id).eq("channel", inv.channel).eq("is_active", true);
+        if (maData) marginAdjustments = maData;
+      } catch (_e) { /* non-fatal */ }
+
+      // Load investor fees for this investor (all product categories + states, resolve per product below)
+      let investorFees = [];
+      try {
+        const { data: feeData } = await client.from("investor_fees")
+          .select("id, investor_id, product_category, state_code, fee_name, fee_amount, fee_box")
+          .eq("investor_id", inv.id).eq("is_active", true);
+        if (feeData) investorFees = feeData;
+      } catch (_e) { /* non-fatal */ }
 
       // Load all rate data across all sheets
       let allBaseRates = [], allMatrices = [];
@@ -1368,14 +1441,30 @@ async function runPricing(client, scenario) {
         if (entries) allEntries.push(...entries);
       }
 
-      const comp = calculateComp(scenario.loan_amount, config);
-
       // Price each product
       for (const ip of products) {
         const product = ip.products;
         if (!product) continue;
 
         const elig = checkEligibility(scenario, ip, product.category);
+
+        // Per-product comp override (from investor_products columns)
+        const productComp = ip.comp_percent != null
+          ? { comp_percent: ip.comp_percent, comp_floor_dollars: ip.comp_floor_dollars, comp_ceiling_dollars: ip.comp_ceiling_dollars }
+          : null;
+
+        // Enhanced comp: per-product override + margin adjustments
+        const comp = calculateCompEnhanced(scenario.loan_amount, config, productComp, marginAdjustments, scenario);
+
+        // Look up investor fee for this product category + property state
+        let investorFee = null;
+        const productCat = product.category;
+        // Exact state match first
+        investorFee = investorFees.find(f => f.product_category === productCat && f.state_code === scenario.state_code);
+        // Fall back to _DEFAULT
+        if (!investorFee) {
+          investorFee = investorFees.find(f => f.product_category === productCat && f.state_code === '_DEFAULT');
+        }
 
         // Non-QM products: enforce minimum 45-day lock period
         const isNQM = (product.category || '').toLowerCase().startsWith('nqm') || (product.code || '').toUpperCase().startsWith('NQM');
@@ -1431,12 +1520,15 @@ async function runPricing(client, scenario) {
             pricing: {
               base_rate_percent: br.rate_percent, base_price_points: br.price_points,
               total_llpa_points: llpaResult.total_points, comp_dollars: comp.comp_dollars,
-              comp_points: comp.comp_points, final_price_points: fp,
+              comp_points: comp.comp_points, margin_adjustment_dollars: comp.margin_adjustment_dollars,
+              final_price_points: fp,
               final_rate_percent: br.rate_percent, apr, monthly_pi: pi,
               estimated_closing_costs: Math.round(scenario.loan_amount * 0.015),
               government_insurance: govIns,
               total_loan_amount: totalLoan,
               total_monthly_payment: totalMonthly,
+              investor_fee_name: investorFee ? investorFee.fee_name : null,
+              investor_fee_amount: investorFee ? investorFee.fee_amount : 0,
             },
             llpa_breakdown: llpaResult.details,
           });
@@ -1449,7 +1541,6 @@ async function runPricing(client, scenario) {
 
   const ranked = rankResults(results, {
     fees_in: scenario.fees_in || false,
-    origination_fee: Number(scenario.origination_fee) || 0,
     loan_amount: scenario.loan_amount || 0,
     til_years: scenario._til_years || 4.25,
     escrow_annual_rate: Number(scenario._escrow_annual_rate) || 1.25,
@@ -1633,8 +1724,16 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
 
           <div className="comp-display">
             Comp: ${first.pricing.comp_dollars.toFixed(0)} ({first.pricing.comp_points.toFixed(3)} pts)
+            {first.pricing.margin_adjustment_dollars > 0 && (
+              <span style={{color:'var(--orange)'}}> (incl. +${first.pricing.margin_adjustment_dollars} margin adj)</span>
+            )}
             {' · '}
             LLPA Total: {first.pricing.total_llpa_points >= 0 ? '+' : ''}{first.pricing.total_llpa_points.toFixed(4)} pts
+            {first.pricing.investor_fee_name && (
+              <span style={{marginLeft:8, color:'var(--text2)'}}>
+                · {first.pricing.investor_fee_name}: ${first.pricing.investor_fee_amount.toLocaleString()}
+              </span>
+            )}
             {first.llpa_breakdown.length > 0 && (
               <span style={{marginLeft:8, color:'var(--accent)', cursor:'pointer', fontSize:11}} onClick={(e) => { e.stopPropagation(); setShowLLPA(!showLLPA); }}>
                 [{showLLPA ? 'hide' : 'show'} breakdown]
@@ -1845,7 +1944,7 @@ function App() {
     is_ami_below_100: false,      // Borrower income ≤100% AMI → partial LLPA relief
     escrow_waiver: 'none',        // 'none' | 'partial' | 'full'
     // Pricing display options
-    origination_fee: 1500,        // Lender origination / UW fee ($)
+    // origination_fee removed — now read from investor_fees table per product/state
     fees_in: true,                // Purchase defaults to fees-in. Refi/HE defaults to fees-out.
     escrow_annual_rate: 1.25,     // Annual escrow estimate as % of property value (taxes + insurance)
     // Analysis options
@@ -2207,8 +2306,8 @@ function App() {
             <h3>Pricing Display</h3>
             <div className="form-row">
               <div className="form-group">
-                <label>Origination Fee ($)</label>
-                <input type="text" value={formatCurrency(form.origination_fee)} onChange={e => updateForm('origination_fee', parseCurrency(e.target.value))} />
+                <label>Investor Fee</label>
+                <input type="text" value="From database" disabled style={{fontStyle:'italic', color:'var(--text3)'}} />
               </div>
               <div className="form-group">
                 <label>Escrow Rate (% of value)</label>
@@ -2556,7 +2655,6 @@ function App() {
                   }}
                   displayOpts={{
                     fees_in: form.fees_in,
-                    origination_fee: Number(form.origination_fee) || 0,
                     escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
                   }}
                   optimizerParams={form.refi_optimize && Number(form.payoff_balance) > 0 ? {
@@ -2564,7 +2662,6 @@ function App() {
                     property_value: Number(form.property_value),
                     desired_cash_back: Number(form.desired_cash_back) || 200,
                     max_ltv_break: getNextLTVBreak(Number(form.loan_amount) / Number(form.property_value) * 100),
-                    origination_fee: Number(form.origination_fee) || 1500,
                     fees_in: form.fees_in,
                     closing_cost_pct: 0.015,
                     monthly_income: (Number(form.borrower_income) || 0) / 12,
