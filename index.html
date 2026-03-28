@@ -58,6 +58,19 @@
   /* Right panel - results */
   .panel-right { flex: 1; overflow-y: auto; padding: 16px 24px; }
 
+  /* Channel tabs */
+  .channel-tabs { display: flex; gap: 4px; margin-bottom: 16px; background: var(--bg2); border-radius: 8px; padding: 4px; border: 1px solid var(--bg3); }
+  .channel-tab { padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; background: transparent; color: var(--text3); transition: all 0.15s; flex: 1; text-align: center; }
+  .channel-tab:hover { color: var(--text); background: var(--bg3); }
+  .channel-tab.active { background: var(--accent2); color: white; }
+  .channel-tab .tab-meta { font-size: 10px; font-weight: 400; opacity: 0.8; display: block; margin-top: 2px; }
+  .channel-tab.disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* Investor badge in rate rows */
+  .investor-badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+  .investor-badge.broker { background: rgba(56,189,248,0.15); color: var(--accent); }
+  .investor-badge.lender { background: rgba(249,115,22,0.15); color: var(--orange); }
+
   /* Execution bar */
   .exec-bar { background: var(--bg2); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: flex; gap: 24px; flex-wrap: wrap; }
   .exec-stat { font-size: 12px; }
@@ -841,6 +854,211 @@ function rankResults(results, opts) {
 }
 
 // =============================================
+// BEST EXECUTION ENGINE
+// =============================================
+
+// Compute the borrower's total lender cost for a single rate result.
+// Lender Cost = discount points (or credits) in $ + investor upfront fees (Box A).
+// This is the metric for best-execution comparison at the same rate.
+function computeLenderCost(r, loanAmount) {
+  const fp = r.pricing.final_price_points; // raw price (base + LLPAs), NOT fees-in adjusted
+  const totalLoan = r.pricing.total_loan_amount || loanAmount;
+  const discountPointsDollars = ((100 - fp) / 100) * totalLoan; // positive = borrower pays, negative = credit
+  const investorFee = r.pricing.investor_fee_amount || 0;
+  return {
+    total: discountPointsDollars + investorFee,
+    discount_points_dollars: discountPointsDollars,
+    investor_fees_dollars: investorFee,
+  };
+}
+
+// Channel display names: map DB enum to UI label
+const CHANNEL_LABELS = { broker: 'Broker', correspondent: 'Lender', lender: 'Lender' };
+// Normalize channel for grouping: treat 'correspondent' and 'lender' as same tab
+function normalizeChannel(ch) { return ch === 'broker' ? 'broker' : 'lender'; }
+
+// Build best-execution groups: within each channel, for each product, pick the
+// lowest-lender-cost investor at each rate level. Returns:
+// { broker: { groups: [...], investorCount, rateCount }, lender: { ... } }
+// Each group is { product_code, product_name, product_category, group: [results] }
+function buildBestExecution(rankedResults, loanAmount, opts) {
+  const feesIn = opts?.fees_in || false;
+  const tilYears = opts?.til_years || 4.25;
+  const tilMonths = Math.round(tilYears * 12);
+  const escrowRate = opts?.escrow_annual_rate || 1.25;
+  const propertyValue = opts?.property_value || 0;
+  const monthlyEscrow = Math.round(propertyValue * (escrowRate / 100) / 12);
+  const monthlyIncome = opts?.monthly_income || 0;
+  const additionalDebt = opts?.additional_debt || 0;
+  const maxDTI = opts?.max_dti || 0.50;
+
+  const eligible = rankedResults.filter(r => r.eligibility.is_eligible && r.pricing);
+
+  // Step 1: Separate by normalized channel
+  const byChannel = new Map();
+  for (const r of eligible) {
+    const ch = normalizeChannel(r.investor_channel || 'broker');
+    if (!byChannel.has(ch)) byChannel.set(ch, []);
+    byChannel.get(ch).push(r);
+  }
+
+  const channelResults = {};
+  for (const [channel, chResults] of byChannel) {
+    const investorSet = new Set(chResults.map(r => r.investor_code));
+
+    // Step 2: Group by product_code within this channel
+    const byProduct = new Map();
+    for (const r of chResults) {
+      if (!byProduct.has(r.product_code)) byProduct.set(r.product_code, []);
+      byProduct.get(r.product_code).push(r);
+    }
+
+    const productGroups = [];
+    for (const [productCode, productResults] of byProduct) {
+      // Step 3: Group by rate within this product
+      const byRate = new Map();
+      for (const r of productResults) {
+        const rateKey = r.pricing.base_rate_percent.toFixed(3);
+        if (!byRate.has(rateKey)) byRate.set(rateKey, []);
+        byRate.get(rateKey).push(r);
+      }
+
+      // Step 4: Pick winner at each rate
+      const bestExResults = [];
+      for (const [rateKey, rateOptions] of byRate) {
+        let winner = rateOptions[0];
+        let winnerCost = computeLenderCost(winner, loanAmount);
+        const alternates = [];
+        for (let i = 1; i < rateOptions.length; i++) {
+          const cost = computeLenderCost(rateOptions[i], loanAmount);
+          if (cost.total < winnerCost.total) {
+            alternates.push({ result: winner, lender_cost: winnerCost });
+            winner = rateOptions[i];
+            winnerCost = cost;
+          } else {
+            alternates.push({ result: rateOptions[i], lender_cost: cost });
+          }
+        }
+        // Attach best-ex metadata to the winning result
+        winner._best_ex = {
+          lender_cost: winnerCost.total,
+          discount_points_dollars: winnerCost.discount_points_dollars,
+          investor_fees_dollars: winnerCost.investor_fees_dollars,
+          competing_count: rateOptions.length,
+          alternates: alternates,
+          savings_vs_next: alternates.length > 0
+            ? Math.min(...alternates.map(a => a.lender_cost.total)) - winnerCost.total
+            : 0,
+        };
+        bestExResults.push(winner);
+      }
+
+      // Step 5: Recompute par rate and analytics for the best-ex group
+      // (analytics need to be relative to this merged group's par, not per-investor par)
+      bestExResults.sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
+
+      // Compute adjusted_final_price for fees-in
+      for (const r of bestExResults) {
+        const invFee = r.pricing.investor_fee_amount || 0;
+        const invFeePoints = (feesIn && loanAmount > 0) ? (invFee / loanAmount) * 100 : 0;
+        r.pricing.adjusted_final_price = feesIn
+          ? r.pricing.final_price_points - invFeePoints
+          : r.pricing.final_price_points;
+      }
+
+      // Find par rate (closest adjusted price to 100)
+      let parIdx = 0, closestDist = Math.abs(bestExResults[0].pricing.adjusted_final_price - 100);
+      for (let i = 1; i < bestExResults.length; i++) {
+        const d = Math.abs(bestExResults[i].pricing.adjusted_final_price - 100);
+        if (d < closestDist) { closestDist = d; parIdx = i; }
+      }
+      for (let i = 0; i < bestExResults.length; i++) {
+        const afp = bestExResults[i].pricing.adjusted_final_price;
+        if (i === parIdx) { bestExResults[i].is_par_rate = true; bestExResults[i].rate_option = "par"; }
+        else if (afp < 100) { bestExResults[i].is_par_rate = false; bestExResults[i].rate_option = "below_par"; }
+        else { bestExResults[i].is_par_rate = false; bestExResults[i].rate_option = "above_par"; }
+      }
+
+      // Recompute analytics (cost-to-par, interest-vs-par, return, DTI) relative to merged par
+      const parR = bestExResults[parIdx];
+      const parAfp = parR.pricing.adjusted_final_price;
+      const parTotalLoan = parR.pricing.total_loan_amount;
+      const parRate = parR.pricing.base_rate_percent;
+      const parTermMo = parR.term_months;
+      const parPointsDollars = ((100 - parAfp) / 100) * parTotalLoan;
+      const parInvFee = feesIn ? 0 : (parR.pricing.investor_fee_amount || 0);
+      const parUpfrontMI = parR.pricing.government_insurance?.upfront_fee_amount || 0;
+      const parEstClosing = parR.pricing.estimated_closing_costs || 0;
+      const parTotalUpfront = parPointsDollars + parInvFee + parUpfrontMI + parEstClosing;
+      const parInterestTIL = cumipmt(parRate, parTermMo, parTotalLoan, 1, tilMonths);
+      const parMonthlyMI = parR.pricing.government_insurance?.monthly_amount || 0;
+      const parMIDurMo = parR.pricing.government_insurance?.duration_months || tilMonths;
+      const parMICost = parMonthlyMI * Math.min(tilMonths, parMIDurMo);
+      const parTotalMonthly = parR.pricing.total_monthly_payment + monthlyEscrow;
+
+      for (const r of bestExResults) {
+        const afp = r.pricing.adjusted_final_price;
+        const totalLoan = r.pricing.total_loan_amount;
+        const rateP = r.pricing.base_rate_percent;
+        const termMo = r.term_months;
+        const miMonthly = r.pricing.government_insurance?.monthly_amount || 0;
+        const miDurMo = r.pricing.government_insurance?.duration_months || tilMonths;
+        const miCost = miMonthly * Math.min(tilMonths, miDurMo);
+        const upfrontMI = r.pricing.government_insurance?.upfront_fee_amount || 0;
+        const estClosing = r.pricing.estimated_closing_costs || 0;
+        const pointsDollars = ((100 - afp) / 100) * totalLoan;
+        const rInvFee = feesIn ? 0 : (r.pricing.investor_fee_amount || 0);
+        const totalUpfront = pointsDollars + rInvFee + upfrontMI + estClosing;
+        const costToPar = totalUpfront - parTotalUpfront;
+        const interestTIL = cumipmt(rateP, termMo, totalLoan, 1, tilMonths);
+        const interestVsPar = (interestTIL + miCost) - (parInterestTIL + parMICost);
+        let twoYearReturn = null;
+        if (Math.abs(costToPar) >= 50) {
+          twoYearReturn = (-interestVsPar - costToPar) / Math.abs(costToPar);
+        }
+        const totalMonthlyFull = r.pricing.total_monthly_payment + monthlyEscrow;
+        const dti = monthlyIncome > 0
+          ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome
+          : 0;
+        const dtiEligible = monthlyIncome <= 0 || dti <= maxDTI;
+
+        r.analytics = {
+          cost_to_par: Math.round(costToPar),
+          interest_vs_par: Math.round(interestVsPar),
+          two_year_return: twoYearReturn,
+          total_monthly_full: Math.round(totalMonthlyFull * 100) / 100,
+          monthly_savings_vs_par: Math.round((parTotalMonthly - totalMonthlyFull) * 100) / 100,
+          dti: Math.round(dti * 10000) / 10000,
+          dti_eligible: dtiEligible,
+        };
+      }
+
+      // Sort by APR and assign product_rank
+      bestExResults.sort((a, b) => a.pricing.apr - b.pricing.apr);
+      bestExResults.forEach((r, i) => { r.product_rank = i + 1; });
+
+      const first = bestExResults[0];
+      productGroups.push({
+        product_code: productCode,
+        product_name: first?.product_name || productCode,
+        product_category: first?.product_category || '',
+        group: bestExResults,
+        bestApr: Math.min(...bestExResults.map(r => r.pricing.apr)),
+      });
+    }
+
+    channelResults[channel] = {
+      groups: productGroups,
+      investorCount: investorSet.size,
+      rateCount: chResults.length,
+      investors: [...investorSet],
+    };
+  }
+
+  return channelResults;
+}
+
+// =============================================
 // PRODUCT DISPLAY ORDER
 // =============================================
 
@@ -1096,6 +1314,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
         _result: r,
         // Columns A-X (PPE output)
         'Investor': r.investor_code,
+        'Channel': r.investor_channel || '',
         'Product': r.product_code,
         'Category': r.product_category,
         'Term (mo)': termMo,
@@ -1125,6 +1344,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
         'Interest': Math.round(interest * 100) / 100,
         'PMI/MIP': Math.round(pmiCost * 100) / 100,
         'Points/Credits': Math.round(pointsCredits * 100) / 100,
+        'Lender Cost': Math.round((pointsCredits + (r.pricing.investor_fee_amount || 0)) * 100) / 100,
         'Investor Fee': uwFee,
         'Investor Fee Name': r.pricing.investor_fee_name || '',
         'Upfront MIP/Funding Fees': Math.round(upfrontMipFf * 100) / 100,
@@ -1214,12 +1434,12 @@ function downloadPricingExcel(response, eligibleGroups, form) {
 
   // --- Build Sheet 1: All Rate Options ---
   const exportCols = [
-    'Investor','Product','Category','Term (mo)','Rate %','Base Price','Total LLPA',
+    'Investor','Channel','Product','Category','Term (mo)','Rate %','Base Price','Total LLPA',
     'Comp $','Comp Pts','Final Price','Final Rate %','APR %','Monthly P&I','Monthly MI',
     'Total Monthly','Total Loan Amt','Est. Closing','GI Type','Upfront Fee %','Upfront Fee $',
     'Par Rate','Rate Option','Global Rank','Product Rank',
     '', // spacer column
-    'Interest','PMI/MIP','Points/Credits','Underwriting Fee','Upfront MIP/Funding Fees',
+    'Interest','PMI/MIP','Points/Credits','Lender Cost','Investor Fee','Investor Fee Name','Upfront MIP/Funding Fees',
     'Other Closing Costs','Total Upfront Costs','Total Cost Over TIL',
     'Rank (Total Cost)','Best of Product','Lowest APR','Highest APR',
     'No Cost Rank','No Cost Loan Option','3-Year Costs','Rank 3-Year','3-Year Winner',
@@ -1246,7 +1466,7 @@ function downloadPricingExcel(response, eligibleGroups, form) {
     }
   }
   if (parRows.length > 0) {
-    const parCols = ['Investor','Product','Category','Rate %','Final Price','APR %','Monthly P&I','Monthly MI','Total Monthly','Total Loan Amt','Total LLPA','Total Cost Over TIL','Rank (Total Cost)','3-Year Costs'];
+    const parCols = ['Investor','Channel','Product','Category','Rate %','Final Price','APR %','Monthly P&I','Monthly MI','Total Monthly','Total Loan Amt','Total LLPA','Lender Cost','Total Cost Over TIL','Rank (Total Cost)','3-Year Costs'];
     const parData = [parCols];
     for (const row of parRows) { parData.push(parCols.map(c => row[c])); }
     const ws2 = XLSX.utils.aoa_to_sheet(parData);
@@ -1479,7 +1699,7 @@ async function runPricing(client, scenario) {
           if (elig.is_eligible) errors.push(`No base rate: ${product.code} @ ${product.term_months}mo/${effectiveLockDays}d`);
           if (!elig.is_eligible) {
             results.push({
-              rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name,
+              rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name, investor_channel: inv.channel,
               product_code: product.code, product_name: product.name, product_category: product.category,
               term_months: product.term_months, rate_sheet_date: sheets[0].effective_date,
               rate_option: "below_par", is_par_rate: false,
@@ -1512,7 +1732,7 @@ async function runPricing(client, scenario) {
           const apr = calcAPR(totalLoan, br.rate_percent, fp, br.term_months);
 
           results.push({
-            rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name,
+            rank: 0, product_rank: 0, investor_code: inv.code, investor_name: inv.name, investor_channel: inv.channel,
             product_code: product.code, product_name: product.name, product_category: product.category,
             term_months: br.term_months, rate_sheet_date: sheets[0].effective_date,
             rate_option: "par", is_par_rate: false,
@@ -1663,10 +1883,14 @@ function LoanSummary({ summary }) {
   );
 }
 
-function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayOpts, optimizerParams }) {
+function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayOpts, optimizerParams, isBestEx }) {
   const first = group[0];
   const parRate = group.find(r => r.is_par_rate);
   const sorted = [...group].sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
+
+  // Best-ex: detect if multiple investors are present in this group
+  const investorCodes = [...new Set(group.map(r => r.investor_code))];
+  const isMultiInvestor = investorCodes.length > 1;
 
   const [expanded, setExpanded] = useState(true);
   const [showLLPA, setShowLLPA] = useState(false);
@@ -1695,6 +1919,16 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
         <div>
           <span className="product-title">{first.product_code}</span>
           <span style={{color:'var(--text3)', fontSize:12, marginLeft:8}}>{first.product_name}</span>
+          {isBestEx && isMultiInvestor && (
+            <span style={{fontSize:10, color:'var(--yellow)', marginLeft:8, fontWeight:600}}>
+              BEST EX: {investorCodes.join(' / ')}
+            </span>
+          )}
+          {isBestEx && !isMultiInvestor && (
+            <span style={{fontSize:10, color:'var(--text3)', marginLeft:8}}>
+              {first.investor_code}
+            </span>
+          )}
         </div>
         <div className="product-badges">
           <span className="product-category">{first.product_category}</span>
@@ -1712,29 +1946,51 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
               <div className="par-highlight">
                 <span className="rate">{parRate.pricing.base_rate_percent.toFixed(3)}%</span>
                 <span className="detail">par rate</span>
+                {isBestEx && isMultiInvestor && (
+                  <span className="detail" style={{fontSize:10, opacity:0.7}}>({parRate.investor_code})</span>
+                )}
                 <span className="detail">|</span>
                 <span className="detail">${(parRate.analytics?.total_monthly_full || parRate.pricing.total_monthly_payment).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}/mo</span>
                 <span className="detail">|</span>
                 <span className="detail">{parRate.pricing.apr.toFixed(3)}% APR</span>
                 <span className="detail">|</span>
                 <span className="detail">Price: {(parRate.pricing.adjusted_final_price ?? parRate.pricing.final_price_points).toFixed(3)}</span>
+                {isBestEx && parRate._best_ex && (
+                  <>
+                    <span className="detail">|</span>
+                    <span className="detail" style={{color: parRate._best_ex.lender_cost < 0 ? 'var(--green)' : 'var(--text2)'}}>
+                      Lender Cost: {parRate._best_ex.lender_cost < 0 ? '-' : ''}${Math.abs(Math.round(parRate._best_ex.lender_cost)).toLocaleString()}
+                    </span>
+                  </>
+                )}
               </div>
             </div>
           )}
 
           <div className="comp-display">
-            Comp: ${first.pricing.comp_dollars.toFixed(0)} ({first.pricing.comp_points.toFixed(3)} pts)
-            {first.pricing.margin_adjustment_dollars > 0 && (
-              <span style={{color:'var(--orange)'}}> (incl. +${first.pricing.margin_adjustment_dollars} margin adj)</span>
-            )}
-            {' · '}
-            LLPA Total: {first.pricing.total_llpa_points >= 0 ? '+' : ''}{first.pricing.total_llpa_points.toFixed(4)} pts
-            {first.pricing.investor_fee_name && (
-              <span style={{marginLeft:8, color:'var(--text2)'}}>
-                · {first.pricing.investor_fee_name}: ${first.pricing.investor_fee_amount.toLocaleString()}
-              </span>
-            )}
-            {first.llpa_breakdown.length > 0 && (
+            {(() => {
+              // Use the summary rate's investor for comp/fee display (handles multi-investor best-ex)
+              const compRef = summaryRate || first;
+              return (
+                <>
+                  Comp: ${compRef.pricing.comp_dollars.toFixed(0)} ({compRef.pricing.comp_points.toFixed(3)} pts)
+                  {compRef.pricing.margin_adjustment_dollars > 0 && (
+                    <span style={{color:'var(--orange)'}}> (incl. +${compRef.pricing.margin_adjustment_dollars} margin adj)</span>
+                  )}
+                  {isBestEx && isMultiInvestor && (
+                    <span style={{fontSize:10, color:'var(--text3)'}}> ({compRef.investor_code})</span>
+                  )}
+                  {' · '}
+                  LLPA Total: {compRef.pricing.total_llpa_points >= 0 ? '+' : ''}{compRef.pricing.total_llpa_points.toFixed(4)} pts
+                  {compRef.pricing.investor_fee_name && (
+                    <span style={{marginLeft:8, color:'var(--text2)'}}>
+                      · {compRef.pricing.investor_fee_name}: ${compRef.pricing.investor_fee_amount.toLocaleString()}
+                    </span>
+                  )}
+                </>
+              );
+            })()}
+            {(summaryRate || first).llpa_breakdown.length > 0 && (
               <span style={{marginLeft:8, color:'var(--accent)', cursor:'pointer', fontSize:11}} onClick={(e) => { e.stopPropagation(); setShowLLPA(!showLLPA); }}>
                 [{showLLPA ? 'hide' : 'show'} breakdown]
               </span>
@@ -1780,30 +2036,40 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
 
           {summary && <LoanSummary summary={summary} />}
 
-          {showLLPA && first.llpa_breakdown.length > 0 && (
-            <div className="llpa-summary">
-              {first.llpa_breakdown.map((l, i) => (
-                <div className="llpa-detail" key={i}>
-                  <span>{l.matrix_name}</span>
-                  <span className={`llpa-value ${l.adjustment_points < 0 ? 'neg' : l.adjustment_points > 0 ? 'pos' : ''}`}>
-                    {l.adjustment_points >= 0 ? '+' : ''}{l.adjustment_points.toFixed(4)}
+          {showLLPA && (() => {
+            const llpaRef = summaryRate || first;
+            return llpaRef.llpa_breakdown.length > 0 ? (
+              <div className="llpa-summary">
+                {isBestEx && isMultiInvestor && (
+                  <div style={{fontSize:10, color:'var(--text3)', marginBottom:4}}>
+                    LLPA breakdown for {llpaRef.investor_code} at {llpaRef.pricing.base_rate_percent.toFixed(3)}%
+                  </div>
+                )}
+                {llpaRef.llpa_breakdown.map((l, i) => (
+                  <div className="llpa-detail" key={i}>
+                    <span>{l.matrix_name}</span>
+                    <span className={`llpa-value ${l.adjustment_points < 0 ? 'neg' : l.adjustment_points > 0 ? 'pos' : ''}`}>
+                      {l.adjustment_points >= 0 ? '+' : ''}{l.adjustment_points.toFixed(4)}
+                    </span>
+                  </div>
+                ))}
+                <div className="llpa-detail llpa-total">
+                  <span>Total</span>
+                  <span className={`llpa-value ${llpaRef.pricing.total_llpa_points < 0 ? 'neg' : 'pos'}`}>
+                    {llpaRef.pricing.total_llpa_points >= 0 ? '+' : ''}{llpaRef.pricing.total_llpa_points.toFixed(4)}
                   </span>
                 </div>
-              ))}
-              <div className="llpa-detail llpa-total">
-                <span>Total</span>
-                <span className={`llpa-value ${first.pricing.total_llpa_points < 0 ? 'neg' : 'pos'}`}>
-                  {first.pricing.total_llpa_points >= 0 ? '+' : ''}{first.pricing.total_llpa_points.toFixed(4)}
-                </span>
               </div>
-            </div>
-          )}
+            ) : null;
+          })()}
 
           <table className="rate-table">
             <thead>
               <tr>
+                {isBestEx && isMultiInvestor && <th style={{width:60}}>Investor</th>}
                 <th>Rate</th>
                 <th>Final Price</th>
+                {isBestEx && <th title="Discount points/credits + investor fees (Box A). The comparison metric for best execution.">Lender Cost</th>}
                 <th>Cost to Par</th>
                 <th>Total Monthly</th>
                 <th title="Cumulative interest + MI savings (or cost) vs par rate over Time in Loan">Interest vs Par</th>
@@ -1845,6 +2111,16 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                 return (
                   <tr key={i} className={r.is_par_rate ? 'par-row' : ''} onClick={() => setSelectedRateIdx(isSelected ? null : sortedIdx)}
                       style={{cursor:'pointer', outline: isSelected ? '1px solid var(--accent)' : 'none', opacity: isDTIFail ? 0.35 : 1}}>
+                    {isBestEx && isMultiInvestor && (
+                      <td>
+                        <span className={`investor-badge ${normalizeChannel(r.investor_channel || 'broker')}`}>
+                          {r.investor_code}
+                        </span>
+                        {r._best_ex?.competing_count > 1 && (
+                          <span style={{fontSize:8, color:'var(--green)', marginLeft:2}} title={`Won against ${r._best_ex.competing_count - 1} other investor(s). Savings: $${Math.abs(Math.round(r._best_ex.savings_vs_next)).toLocaleString()}`}>W</span>
+                        )}
+                      </td>
+                    )}
                     <td style={{fontWeight: r.is_par_rate ? 700 : 400}}>
                       {r.pricing.base_rate_percent.toFixed(3)}%
                       {r.is_par_rate && <span className="par-badge" style={{marginLeft:6}}>PAR</span>}
@@ -1853,6 +2129,15 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                     <td style={{color: afp < 99.9 ? 'var(--red)' : afp > 100.1 ? 'var(--green)' : 'var(--text)'}}>
                       {afp.toFixed(3)}
                     </td>
+                    {isBestEx && (() => {
+                      const lc = r._best_ex?.lender_cost ?? 0;
+                      const lcRound = Math.round(lc);
+                      return (
+                        <td style={{color: lc < -50 ? 'var(--green)' : lc > 50 ? 'var(--text)' : 'var(--text2)', fontSize:12}}>
+                          {lcRound < 0 ? '-$' + Math.abs(lcRound).toLocaleString() : '$' + lcRound.toLocaleString()}
+                        </td>
+                      );
+                    })()}
                     <td style={{color: ctp > 50 ? 'var(--red)' : ctp < -50 ? 'var(--green)' : 'var(--text2)', fontWeight: r.is_par_rate ? 400 : 500}}>
                       {r.is_par_rate ? '$0' : ctp > 0 ? '+$' + ctp.toLocaleString() : ctp < 0 ? '-$' + Math.abs(ctp).toLocaleString() : '$0'}
                     </td>
@@ -1909,6 +2194,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState(null);
   const [expandedProducts, setExpandedProducts] = useState({});
+  const [activeChannel, setActiveChannel] = useState('broker'); // 'broker' or 'lender'
+  const [bestExData, setBestExData] = useState(null); // { broker: {...}, lender: {...} }
   const clientRef = useRef(null);
 
   // Form state
@@ -2066,9 +2353,27 @@ function App() {
 
     setLoading(true);
     setResponse(null);
+    setBestExData(null);
     try {
       const res = await runPricing(clientRef.current, resolved);
       setResponse(res);
+
+      // Build best execution after pricing completes
+      if (res?.results?.length > 0) {
+        const bex = buildBestExecution(res.results, Number(form.loan_amount), {
+          fees_in: form.fees_in || false,
+          til_years: getEffectiveTimeInLoan(form),
+          escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
+          property_value: Number(form.property_value) || 0,
+          monthly_income: (Number(form.borrower_income) || 0) / 12,
+          additional_debt: Number(form.additional_debt_service) || 0,
+          max_dti: 0.50,
+        });
+        setBestExData(bex);
+        // Auto-select first available channel
+        if (bex.broker?.groups?.length > 0) setActiveChannel('broker');
+        else if (bex.lender?.groups?.length > 0) setActiveChannel('lender');
+      }
     } catch (e) {
       setResponse({ errors: [e.message], results: [], meta: {} });
     }
@@ -2080,39 +2385,38 @@ function App() {
     (form.excluded_products || '').split(',').map(s => s.trim()).filter(Boolean)
   );
 
-  // Group results by product (filtering exclusions)
+  // --- Best Execution channel-aware grouping ---
+  const hasBroker = bestExData?.broker?.groups?.length > 0;
+  const hasLender = bestExData?.lender?.groups?.length > 0;
+  const availableChannels = [];
+  if (hasBroker) availableChannels.push('broker');
+  if (hasLender) availableChannels.push('lender');
+
+  // Get the active channel's best-ex groups, filtered by product exclusions, sorted by product priority
+  const activeChData = bestExData?.[activeChannel];
   const eligibleGroups = [];
-  const ineligibleResults = [];
-  if (response?.results) {
-    const gmap = new Map();
-    for (const r of response.results) {
-      if (excludedSet.has(r.product_code)) continue; // skip excluded products
-      if (r.eligibility.is_eligible && r.pricing) {
-        const k = `${r.investor_code}::${r.product_code}`;
-        if (!gmap.has(k)) gmap.set(k, []);
-        gmap.get(k).push(r);
-      } else if (!r.eligibility.is_eligible) {
-        ineligibleResults.push(r);
-      }
-    }
-    // Sort groups by best APR in each group
-    for (const [k, group] of gmap) {
-      const bestApr = Math.min(...group.map(r => r.pricing.apr));
-      eligibleGroups.push({ key: k, group, bestApr });
-    }
-    // Sort by custom product priority (Conv30 first, VA first if veteran), then by APR within same priority
+  if (activeChData?.groups) {
     const isVet = form.is_veteran;
+    for (const pg of activeChData.groups) {
+      if (excludedSet.has(pg.product_code)) continue;
+      eligibleGroups.push({ key: pg.product_code, group: pg.group, bestApr: pg.bestApr });
+    }
     eligibleGroups.sort((a, b) => {
-      const codeA = a.group[0]?.product_code || '';
-      const codeB = b.group[0]?.product_code || '';
-      const prioA = getProductSortOrder(codeA, isVet);
-      const prioB = getProductSortOrder(codeB, isVet);
+      const prioA = getProductSortOrder(a.key, isVet);
+      const prioB = getProductSortOrder(b.key, isVet);
       if (prioA !== prioB) return prioA - prioB;
       return a.bestApr - b.bestApr;
     });
   }
 
-  // Dedupe ineligible by product code
+  // Ineligible results (deduplicated by product code, channel-independent)
+  const ineligibleResults = [];
+  if (response?.results) {
+    for (const r of response.results) {
+      if (excludedSet.has(r.product_code)) continue;
+      if (!r.eligibility.is_eligible) ineligibleResults.push(r);
+    }
+  }
   const ineligibleDeduped = [];
   const seen = new Set();
   for (const r of ineligibleResults) {
@@ -2122,11 +2426,29 @@ function App() {
     }
   }
 
+  // --- Legacy ungrouped eligibleGroups for Excel export (all investors, all channels) ---
+  const allEligibleGroups = [];
+  if (response?.results) {
+    const gmap = new Map();
+    for (const r of response.results) {
+      if (excludedSet.has(r.product_code)) continue;
+      if (r.eligibility.is_eligible && r.pricing) {
+        const k = `${r.investor_code}::${r.product_code}`;
+        if (!gmap.has(k)) gmap.set(k, []);
+        gmap.get(k).push(r);
+      }
+    }
+    for (const [k, group] of gmap) {
+      const bestApr = Math.min(...group.map(r => r.pricing.apr));
+      allEligibleGroups.push({ key: k, group, bestApr });
+    }
+  }
+
   return (
     <div className="app">
       <div className="header">
         <h1>Hatch PPE — Pricing Test Tool</h1>
-        <div className="meta">v1.0 · Planet Home Lending data loaded</div>
+        <div className="meta">v1.1 · Best Execution</div>
       </div>
 
       <div className="conn-bar">
@@ -2620,7 +2942,7 @@ function App() {
                 <button
                   className="btn btn-excel"
                   style={{background:'var(--bg3)', color:'var(--accent)', padding:'4px 14px', fontSize:12, marginLeft:'auto', border:'1px solid var(--border)'}}
-                  onClick={() => downloadPricingExcel(response, eligibleGroups, form)}
+                  onClick={() => downloadPricingExcel(response, allEligibleGroups, form)}
                   title="Download all pricing results to Excel"
                 >
                   Download Excel
@@ -2634,6 +2956,36 @@ function App() {
                 </div>
               )}
 
+              {/* === Channel Tabs === */}
+              {availableChannels.length > 0 && (
+                <div className="channel-tabs">
+                  {['broker', 'lender'].map(ch => {
+                    const chData = bestExData?.[ch];
+                    const hasData = chData?.groups?.length > 0;
+                    const label = ch === 'broker' ? 'Broker' : 'Lender';
+                    const investorNames = chData?.investors?.join(', ') || '';
+                    const productCount = chData?.groups?.filter(g => !excludedSet.has(g.product_code)).length || 0;
+                    return (
+                      <button
+                        key={ch}
+                        className={`channel-tab ${activeChannel === ch ? 'active' : ''} ${!hasData ? 'disabled' : ''}`}
+                        onClick={() => hasData && setActiveChannel(ch)}
+                        disabled={!hasData}
+                      >
+                        {label} Best Execution
+                        {hasData && (
+                          <span className="tab-meta">
+                            {chData.investorCount} investor{chData.investorCount !== 1 ? 's' : ''} · {productCount} product{productCount !== 1 ? 's' : ''}
+                            {chData.investorCount <= 3 && ` · ${investorNames}`}
+                          </span>
+                        )}
+                        {!hasData && <span className="tab-meta">No pricing</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               {eligibleGroups.length === 0 && ineligibleDeduped.length === 0 && (
                 <div className="empty-state">
                   <h2>No Results</h2>
@@ -2643,10 +2995,10 @@ function App() {
 
               {eligibleGroups.map(({ key, group }) => (
                 <ProductGroup
-                  key={key}
+                  key={`${activeChannel}::${key}`}
                   group={group}
-                  showAll={expandedProducts[key] || false}
-                  onToggle={() => setExpandedProducts(prev => ({...prev, [key]: !prev[key]}))}
+                  showAll={expandedProducts[`${activeChannel}::${key}`] || false}
+                  onToggle={() => setExpandedProducts(prev => ({...prev, [`${activeChannel}::${key}`]: !prev[`${activeChannel}::${key}`]}))}
                   loanAmount={Number(form.loan_amount)}
                   scenario={{
                     loan_amount: Number(form.loan_amount),
@@ -2669,6 +3021,7 @@ function App() {
                     escrow_monthly: Math.round(Number(form.property_value) * (Number(form.escrow_annual_rate) || 1.25) / 100 / 12),
                     max_dti: 0.50,
                   } : null}
+                  isBestEx={true}
                 />
               ))}
 
@@ -2700,4 +3053,3 @@ ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App 
 </script>
 </body>
 </html>
-
