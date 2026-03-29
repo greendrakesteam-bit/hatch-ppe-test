@@ -545,15 +545,20 @@ function calcLoanSummary(rateOption, scenario, opts) {
   const invFee = p.investor_fee_amount || 0;
   const escrowAnnualRate = opts.escrow_annual_rate || 1.25;
 
+  // When the refi optimizer is active, use the per-rate optimal loan amount
+  // instead of the scenario's original loan amount for all cost calculations.
+  const opt = rateOption._optimizer;
+  const effectiveLoanAmount = opt ? opt.optimal_loan : scenario.loan_amount;
+
   // --- Fees-in adjustment ---
   // When fees-in: investor fee is converted to points and subtracted from price
   // This effectively shifts the par rate up (rates look higher, but no separate fee line item)
-  const invFeePoints = scenario.loan_amount > 0 ? (invFee / scenario.loan_amount) * 100 : 0;
+  const invFeePoints = effectiveLoanAmount > 0 ? (invFee / effectiveLoanAmount) * 100 : 0;
   const adjustedFinalPrice = feesIn ? p.final_price_points - invFeePoints : p.final_price_points;
 
   // --- Cost of Interest Rate (discount points in dollars) ---
   // Below 100 = borrower pays points (cost), Above 100 = borrower gets credit
-  const costOfRate = ((100 - adjustedFinalPrice) / 100) * scenario.loan_amount;
+  const costOfRate = ((100 - adjustedFinalPrice) / 100) * effectiveLoanAmount;
 
   // --- Cost of Mortgage Insurance (upfront, even if financed) ---
   const costOfMI = gi.upfront_fee_amount || 0;
@@ -566,19 +571,22 @@ function calcLoanSummary(rateOption, scenario, opts) {
   const totalLenderCosts = costOfRate + costOfMI + otherLenderCosts;
 
   // --- Other Closing Costs (unavoidable) --- placeholder 1.5%
-  const otherClosingCosts = Math.round(scenario.loan_amount * 0.015);
+  const otherClosingCosts = Math.round(effectiveLoanAmount * 0.015);
 
   // --- Down Payment (purchase only) ---
   const downPayment = scenario.purpose === "purchase"
-    ? Math.max(0, scenario.property_value - scenario.loan_amount)
+    ? Math.max(0, scenario.property_value - effectiveLoanAmount)
     : 0;
 
   // --- Cash Required to Close ---
-  // Total Lender Costs already includes credits as negative costOfRate
-  const cashToClose = totalLenderCosts + otherClosingCosts + downPayment;
+  // For refi with optimizer: cash to close comes from optimizer's cash_to_borrower
+  // (accounts for payoff, closing costs, points, and proceeds)
+  const cashToClose = opt
+    ? -opt.cash_to_borrower  // negative cash_to_borrower = borrower pays; positive = borrower receives
+    : totalLenderCosts + otherClosingCosts + downPayment;
 
   // --- Loan Amount (debt) = total loan including financed MI ---
-  const loanDebt = p.total_loan_amount || scenario.loan_amount;
+  const loanDebt = p.total_loan_amount || effectiveLoanAmount;
 
   // --- Monthly Payment Breakdown ---
   const monthlyPI = p.monthly_pi;
@@ -610,6 +618,8 @@ function calcLoanSummary(rateOption, scenario, opts) {
     adjusted_final_price: Math.round(adjustedFinalPrice * 10000) / 10000,
     gi_type: gi.type,
     gi_duration: gi.duration_label || "N/A",
+    // Optimizer data (if active)
+    optimizer: opt || null,
   };
 }
 
@@ -1460,6 +1470,27 @@ function solveOptimalLoan(rateResult, params) {
     total_monthly: Math.round(optTotalMonthly * 100) / 100,
     monthly_pi: optPI,
   };
+}
+
+// --- Apply Refi Optimizer to all results ---
+// When active, each rate row's optimal loan amount becomes the effective loan amount
+// for all downstream calculations (P&I, APR, analytics, lender cost, etc.)
+function applyRefiOptimizer(results, optimizerParams) {
+  if (!optimizerParams) return;
+  const eligible = results.filter(r => r.eligibility.is_eligible && r.pricing);
+  for (const r of eligible) {
+    const opt = solveOptimalLoan(r, optimizerParams);
+    r._optimizer = opt;
+    // Update the pricing fields to reflect the optimal loan amount
+    const gi = r.pricing.government_insurance || { upfront_financed: false, upfront_fee_amount: 0, monthly_amount: 0 };
+    const optLoan = opt.optimal_loan;
+    const optTotalLoan = gi.upfront_financed ? optLoan + gi.upfront_fee_amount : optLoan;
+    r.pricing.total_loan_amount = optTotalLoan;
+    r.pricing.monthly_pi = monthlyPI(optTotalLoan, r.pricing.base_rate_percent, r.term_months);
+    r.pricing.total_monthly_payment = r.pricing.monthly_pi + (gi.monthly_amount || 0);
+    r.pricing.apr = calcAPR(optTotalLoan, r.pricing.base_rate_percent, r.pricing.final_price_points, r.term_months);
+    r.pricing.estimated_closing_costs = Math.round(optLoan * 0.015);
+  }
 }
 
 // --- Auto Time in Loan (years) ---
@@ -2329,8 +2360,8 @@ function ProductGroup({ group, showAll, onToggle, loanAmount, scenario, displayO
                 const isSelected = selectedRateIdx === sortedIdx;
                 const isDTIFail = a.dti_eligible === false;
 
-                // Optimizer solve per rate
-                const opt = optimizerParams ? solveOptimalLoan(r, optimizerParams) : null;
+                // Optimizer data (pre-computed in applyRefiOptimizer, or computed here for legacy fallback)
+                const opt = r._optimizer || (optimizerParams ? solveOptimalLoan(r, optimizerParams) : null);
 
                 // Return display: cap at ±999%, show PAR for par row, — for noise
                 let retDisplay = '—';
@@ -2600,6 +2631,24 @@ function App() {
     setBestExData(null);
     try {
       const res = await runPricing(clientRef.current, resolved);
+
+      // Apply refi optimizer BEFORE best-execution so all downstream analytics
+      // (P&I, APR, cost-to-par, interest-vs-par, lender cost) use the per-rate optimal loan amount.
+      if (form.refi_optimize && Number(form.payoff_balance) > 0 && res?.results?.length > 0) {
+        applyRefiOptimizer(res.results, {
+          payoff_balance: Number(form.payoff_balance),
+          property_value: Number(form.property_value),
+          desired_cash_back: Number(form.desired_cash_back) || 200,
+          max_ltv_break: getNextLTVBreak(Number(form.loan_amount) / Number(form.property_value) * 100),
+          fees_in: form.fees_in,
+          closing_cost_pct: 0.015,
+          monthly_income: (Number(form.borrower_income) || 0) / 12,
+          additional_debt: Number(form.additional_debt_service) || 0,
+          escrow_monthly: Math.round(Number(form.property_value) * (Number(form.escrow_annual_rate) || 1.25) / 100 / 12),
+          max_dti: 0.50,
+        });
+      }
+
       setResponse(res);
 
       // Build best execution after pricing completes
