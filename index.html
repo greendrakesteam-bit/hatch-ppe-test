@@ -1813,6 +1813,7 @@ async function runPricing(client, scenario) {
   const start = Date.now();
   const errors = [];
   const results = [];
+  const rateSheetMeta = []; // collect per-investor rate sheet dates for display
 
   // Get all investors
   const { data: investors, error: invErr } = await client.from("investors").select("id, name, code, channel");
@@ -1829,6 +1830,16 @@ async function runPricing(client, scenario) {
         .eq("investor_id", inv.id).eq("status", "active")
         .order("effective_date", { ascending: false });
       if (!sheets?.length) { errors.push(`No active rate sheet: ${inv.code}`); continue; }
+
+      // Track rate sheet metadata for freshness display
+      const sheetDate = sheets[0].effective_date;
+      const today = new Date().toISOString().slice(0, 10);
+      rateSheetMeta.push({
+        investor_code: inv.code,
+        investor_name: inv.name,
+        effective_date: sheetDate,
+        is_fresh: sheetDate === today,
+      });
 
       // Config
       const { data: config } = await client.from("investor_configs")
@@ -1992,8 +2003,11 @@ async function runPricing(client, scenario) {
     additional_debt: scenario._additional_debt || 0,
     max_dti: 0.50,
   });
+  const hasStaleness = rateSheetMeta.some(rs => !rs.is_fresh);
   return {
     results: ranked, errors,
+    rate_sheet_metadata: rateSheetMeta,
+    staleness_warning: hasStaleness,
     meta: {
       execution_ms: Date.now() - start,
       investors_queried: investors?.length || 0,
@@ -2466,7 +2480,14 @@ function App() {
     desired_cash_back: 200,       // Target cash to borrower at closing ($)
   });
 
-  const updateForm = (field, value) => setForm(prev => ({...prev, [field]: value}));
+  const updateForm = (field, value) => setForm(prev => {
+    const next = {...prev, [field]: value};
+    // Auto-uncheck FTHB when purpose changes away from purchase
+    if (field === 'purpose' && value !== 'purchase') {
+      next.is_first_time_buyer = false;
+    }
+    return next;
+  });
 
   // --- Default Lock Period Logic ---
   // Priority: longest applicable lock wins.
@@ -2906,8 +2927,8 @@ function App() {
             <h3>Scenario Flags</h3>
             <div className="form-row">
               <div className="form-group">
-                <label style={{display:'flex', alignItems:'center', gap:6}}>
-                  <input type="checkbox" checked={form.is_first_time_buyer} onChange={e => updateForm('is_first_time_buyer', e.target.checked)} style={{width:'auto'}} />
+                <label style={{display:'flex', alignItems:'center', gap:6, opacity: form.purpose !== 'purchase' ? 0.4 : 1}}>
+                  <input type="checkbox" checked={form.is_first_time_buyer} disabled={form.purpose !== 'purchase'} onChange={e => updateForm('is_first_time_buyer', e.target.checked)} style={{width:'auto'}} />
                   First-Time Homebuyer
                 </label>
               </div>
@@ -3019,7 +3040,7 @@ function App() {
                   <div className="form-row">
                     <div className="form-group" style={{flex:1}}>
                       <label>Target Cash Back ($)</label>
-                      <input type="number" value={form.desired_cash_back} onChange={e => updateForm('desired_cash_back', Number(e.target.value))} style={{width:'100%'}} />
+                      <input type="number" value={form.desired_cash_back} onChange={e => updateForm('desired_cash_back', e.target.value === '' ? '' : Number(e.target.value))} style={{width:'100%'}} />
                     </div>
                     <div className="form-group" style={{flex:1}}>
                       <label>Max LTV Break (%)</label>
@@ -3179,6 +3200,40 @@ function App() {
                   Download Excel
                 </button>
               </div>
+
+              {/* === Rate Sheet Freshness Banner === */}
+              {response.rate_sheet_metadata && response.rate_sheet_metadata.length > 0 && (
+                <div style={{
+                  background: 'var(--bg2)',
+                  border: `1px solid ${response.staleness_warning ? 'var(--red)' : 'var(--border)'}`,
+                  borderRadius: '8px',
+                  padding: '12px 16px',
+                  marginBottom: '16px',
+                  fontSize: '12px',
+                }}>
+                  <div style={{color: response.staleness_warning ? 'var(--red)' : 'var(--accent)', fontWeight: 600, marginBottom: '8px'}}>
+                    {response.staleness_warning && '⚠ '}Rate Sheet Status
+                  </div>
+                  <div style={{display: 'flex', gap: '16px', flexWrap: 'wrap', color: 'var(--text2)', fontSize: '11px'}}>
+                    {response.rate_sheet_metadata.map((rs, idx) => (
+                      <div key={idx} style={{display: 'flex', gap: '4px', alignItems: 'center'}}>
+                        <span style={{fontWeight: 600}}>{rs.investor_code}:</span>
+                        <span>{rs.effective_date}</span>
+                        {rs.is_fresh ? (
+                          <span style={{color: 'var(--green)', fontWeight: 600}}>✓ Fresh</span>
+                        ) : (
+                          <span style={{color: 'var(--yellow)'}}>Stale</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  {response.staleness_warning && (
+                    <div style={{marginTop: '8px', color: 'var(--red)', fontSize: '11px', fontStyle: 'italic'}}>
+                      Pricing is based on prior-day rate sheets. Today's rates are not yet available.
+                    </div>
+                  )}
+                </div>
+              )}
 
               {response.errors?.length > 0 && (
                 <div className="warnings">
