@@ -1058,6 +1058,229 @@ function buildBestExecution(rankedResults, loanAmount, opts) {
   return channelResults;
 }
 
+// Build the overall Best Execution tab by comparing broker best-ex winners
+// against lender best-ex winners at each rate within each product.
+// Takes the already-computed channel results from buildBestExecution.
+function buildOverallBestExecution(channelResults, loanAmount, opts) {
+  const feesIn = opts?.fees_in || false;
+  const tilYears = opts?.til_years || 4.25;
+  const tilMonths = Math.round(tilYears * 12);
+  const escrowRate = opts?.escrow_annual_rate || 1.25;
+  const propertyValue = opts?.property_value || 0;
+  const monthlyEscrow = Math.round(propertyValue * (escrowRate / 100) / 12);
+  const monthlyIncome = opts?.monthly_income || 0;
+  const additionalDebt = opts?.additional_debt || 0;
+  const maxDTI = opts?.max_dti || 0.50;
+
+  const brokerGroups = channelResults.broker?.groups || [];
+  const lenderGroups = channelResults.lender?.groups || [];
+
+  // Index lender groups by product_code for fast lookup
+  const lenderByProduct = new Map();
+  for (const pg of lenderGroups) {
+    lenderByProduct.set(pg.product_code, pg);
+  }
+
+  // Collect all unique product codes across both channels
+  const allProductCodes = new Set();
+  for (const pg of brokerGroups) allProductCodes.add(pg.product_code);
+  for (const pg of lenderGroups) allProductCodes.add(pg.product_code);
+
+  const investorSet = new Set();
+  const productGroupsOut = [];
+
+  for (const productCode of allProductCodes) {
+    const brokerPG = brokerGroups.find(pg => pg.product_code === productCode);
+    const lenderPG = lenderByProduct.get(productCode);
+
+    // If only one channel has this product, use it directly (deep copy _best_ex to avoid mutation)
+    if (!brokerPG && lenderPG) {
+      for (const r of lenderPG.group) investorSet.add(r.investor_code);
+      productGroupsOut.push({ ...lenderPG });
+      continue;
+    }
+    if (brokerPG && !lenderPG) {
+      for (const r of brokerPG.group) investorSet.add(r.investor_code);
+      productGroupsOut.push({ ...brokerPG });
+      continue;
+    }
+
+    // Both channels have this product — merge at the rate level
+    // Index lender rates by rate key
+    const lenderByRate = new Map();
+    for (const r of lenderPG.group) {
+      lenderByRate.set(r.pricing.base_rate_percent.toFixed(3), r);
+    }
+    const brokerByRate = new Map();
+    for (const r of brokerPG.group) {
+      brokerByRate.set(r.pricing.base_rate_percent.toFixed(3), r);
+    }
+
+    // Union of all rate keys
+    const allRateKeys = new Set([...brokerByRate.keys(), ...lenderByRate.keys()]);
+
+    const mergedResults = [];
+    for (const rateKey of allRateKeys) {
+      const brokerR = brokerByRate.get(rateKey);
+      const lenderR = lenderByRate.get(rateKey);
+
+      if (!brokerR && lenderR) {
+        // Only lender has this rate — clone with updated _best_ex
+        const winner = { ...lenderR };
+        const lc = computeLenderCost(lenderR, loanAmount);
+        winner._best_ex = {
+          ...lenderR._best_ex,
+          lender_cost: lc.total,
+          discount_points_dollars: lc.discount_points_dollars,
+          investor_fees_dollars: lc.investor_fees_dollars,
+          cross_channel_winner: true,
+          cross_channel_competing: 1,
+          cross_channel_savings: 0,
+          losing_channel: null,
+        };
+        mergedResults.push(winner);
+        investorSet.add(lenderR.investor_code);
+      } else if (brokerR && !lenderR) {
+        // Only broker has this rate
+        const winner = { ...brokerR };
+        const lc = computeLenderCost(brokerR, loanAmount);
+        winner._best_ex = {
+          ...brokerR._best_ex,
+          lender_cost: lc.total,
+          discount_points_dollars: lc.discount_points_dollars,
+          investor_fees_dollars: lc.investor_fees_dollars,
+          cross_channel_winner: true,
+          cross_channel_competing: 1,
+          cross_channel_savings: 0,
+          losing_channel: null,
+        };
+        mergedResults.push(winner);
+        investorSet.add(brokerR.investor_code);
+      } else {
+        // Both channels have this rate — pick lower lender cost
+        const brokerLC = computeLenderCost(brokerR, loanAmount);
+        const lenderLC = computeLenderCost(lenderR, loanAmount);
+        const brokerWins = brokerLC.total <= lenderLC.total;
+        const winner = brokerWins ? { ...brokerR } : { ...lenderR };
+        const loser = brokerWins ? lenderR : brokerR;
+        const winnerLC = brokerWins ? brokerLC : lenderLC;
+        const loserLC = brokerWins ? lenderLC : brokerLC;
+
+        winner._best_ex = {
+          ...(brokerWins ? brokerR._best_ex : lenderR._best_ex),
+          lender_cost: winnerLC.total,
+          discount_points_dollars: winnerLC.discount_points_dollars,
+          investor_fees_dollars: winnerLC.investor_fees_dollars,
+          cross_channel_winner: true,
+          cross_channel_competing: 2,
+          cross_channel_savings: loserLC.total - winnerLC.total,
+          losing_channel: brokerWins ? 'lender' : 'broker',
+          losing_investor: loser.investor_code,
+          losing_lender_cost: loserLC.total,
+        };
+        mergedResults.push(winner);
+        investorSet.add(winner.investor_code);
+      }
+    }
+
+    // Recompute par rate, analytics on the merged set (same logic as buildBestExecution)
+    mergedResults.sort((a, b) => a.pricing.base_rate_percent - b.pricing.base_rate_percent);
+
+    for (const r of mergedResults) {
+      const invFee = r.pricing.investor_fee_amount || 0;
+      const invFeePoints = (feesIn && loanAmount > 0) ? (invFee / loanAmount) * 100 : 0;
+      r.pricing.adjusted_final_price = feesIn
+        ? r.pricing.final_price_points - invFeePoints
+        : r.pricing.final_price_points;
+    }
+
+    let parIdx = 0, closestDist = Math.abs(mergedResults[0].pricing.adjusted_final_price - 100);
+    for (let i = 1; i < mergedResults.length; i++) {
+      const d = Math.abs(mergedResults[i].pricing.adjusted_final_price - 100);
+      if (d < closestDist) { closestDist = d; parIdx = i; }
+    }
+    for (let i = 0; i < mergedResults.length; i++) {
+      const afp = mergedResults[i].pricing.adjusted_final_price;
+      if (i === parIdx) { mergedResults[i].is_par_rate = true; mergedResults[i].rate_option = "par"; }
+      else if (afp < 100) { mergedResults[i].is_par_rate = false; mergedResults[i].rate_option = "below_par"; }
+      else { mergedResults[i].is_par_rate = false; mergedResults[i].rate_option = "above_par"; }
+    }
+
+    // Analytics relative to merged par
+    const parR = mergedResults[parIdx];
+    const parAfp = parR.pricing.adjusted_final_price;
+    const parTotalLoan = parR.pricing.total_loan_amount;
+    const parRate = parR.pricing.base_rate_percent;
+    const parTermMo = parR.term_months;
+    const parPointsDollars = ((100 - parAfp) / 100) * parTotalLoan;
+    const parInvFee = feesIn ? 0 : (parR.pricing.investor_fee_amount || 0);
+    const parUpfrontMI = parR.pricing.government_insurance?.upfront_fee_amount || 0;
+    const parEstClosing = parR.pricing.estimated_closing_costs || 0;
+    const parTotalUpfront = parPointsDollars + parInvFee + parUpfrontMI + parEstClosing;
+    const parInterestTIL = cumipmt(parRate, parTermMo, parTotalLoan, 1, tilMonths);
+    const parMonthlyMI = parR.pricing.government_insurance?.monthly_amount || 0;
+    const parMIDurMo = parR.pricing.government_insurance?.duration_months || tilMonths;
+    const parMICost = parMonthlyMI * Math.min(tilMonths, parMIDurMo);
+    const parTotalMonthly = parR.pricing.total_monthly_payment + monthlyEscrow;
+
+    for (const r of mergedResults) {
+      const afp = r.pricing.adjusted_final_price;
+      const totalLoan = r.pricing.total_loan_amount;
+      const rateP = r.pricing.base_rate_percent;
+      const termMo = r.term_months;
+      const miMonthly = r.pricing.government_insurance?.monthly_amount || 0;
+      const miDurMo = r.pricing.government_insurance?.duration_months || tilMonths;
+      const miCost = miMonthly * Math.min(tilMonths, miDurMo);
+      const upfrontMI = r.pricing.government_insurance?.upfront_fee_amount || 0;
+      const estClosing = r.pricing.estimated_closing_costs || 0;
+      const pointsDollars = ((100 - afp) / 100) * totalLoan;
+      const rInvFee = feesIn ? 0 : (r.pricing.investor_fee_amount || 0);
+      const totalUpfront = pointsDollars + rInvFee + upfrontMI + estClosing;
+      const costToPar = totalUpfront - parTotalUpfront;
+      const interestTIL = cumipmt(rateP, termMo, totalLoan, 1, tilMonths);
+      const interestVsPar = (interestTIL + miCost) - (parInterestTIL + parMICost);
+      let twoYearReturn = null;
+      if (Math.abs(costToPar) >= 50) {
+        twoYearReturn = (-interestVsPar - costToPar) / Math.abs(costToPar);
+      }
+      const totalMonthlyFull = r.pricing.total_monthly_payment + monthlyEscrow;
+      const dti = monthlyIncome > 0
+        ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome
+        : 0;
+      const dtiEligible = monthlyIncome <= 0 || dti <= maxDTI;
+
+      r.analytics = {
+        cost_to_par: Math.round(costToPar),
+        interest_vs_par: Math.round(interestVsPar),
+        two_year_return: twoYearReturn,
+        total_monthly_full: Math.round(totalMonthlyFull * 100) / 100,
+        monthly_savings_vs_par: Math.round((parTotalMonthly - totalMonthlyFull) * 100) / 100,
+        dti: Math.round(dti * 10000) / 10000,
+        dti_eligible: dtiEligible,
+      };
+    }
+
+    mergedResults.sort((a, b) => a.pricing.apr - b.pricing.apr);
+    mergedResults.forEach((r, i) => { r.product_rank = i + 1; });
+
+    const first = mergedResults[0];
+    productGroupsOut.push({
+      product_code: productCode,
+      product_name: first?.product_name || productCode,
+      product_category: first?.product_category || '',
+      group: mergedResults,
+      bestApr: Math.min(...mergedResults.map(r => r.pricing.apr)),
+    });
+  }
+
+  return {
+    groups: productGroupsOut,
+    investorCount: investorSet.size,
+    rateCount: productGroupsOut.reduce((sum, pg) => sum + pg.group.length, 0),
+    investors: [...investorSet],
+  };
+}
+
 // =============================================
 // PRODUCT DISPLAY ORDER
 // =============================================
@@ -2194,7 +2417,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState(null);
   const [expandedProducts, setExpandedProducts] = useState({});
-  const [activeChannel, setActiveChannel] = useState('broker'); // 'broker' or 'lender'
+  const [activeChannel, setActiveChannel] = useState('best_ex'); // 'best_ex', 'broker', or 'lender'
   const [bestExData, setBestExData] = useState(null); // { broker: {...}, lender: {...} }
   const clientRef = useRef(null);
 
@@ -2369,10 +2592,20 @@ function App() {
           additional_debt: Number(form.additional_debt_service) || 0,
           max_dti: 0.50,
         });
+        // Build overall best execution (cross-channel comparison)
+        const bexOpts = {
+          fees_in: form.fees_in || false,
+          til_years: getEffectiveTimeInLoan(form),
+          escrow_annual_rate: Number(form.escrow_annual_rate) || 1.25,
+          property_value: Number(form.property_value) || 0,
+          monthly_income: (Number(form.borrower_income) || 0) / 12,
+          additional_debt: Number(form.additional_debt_service) || 0,
+          max_dti: 0.50,
+        };
+        bex.best_ex = buildOverallBestExecution(bex, Number(form.loan_amount), bexOpts);
         setBestExData(bex);
-        // Auto-select first available channel
-        if (bex.broker?.groups?.length > 0) setActiveChannel('broker');
-        else if (bex.lender?.groups?.length > 0) setActiveChannel('lender');
+        // Always default to the overall Best Execution tab
+        setActiveChannel('best_ex');
       }
     } catch (e) {
       setResponse({ errors: [e.message], results: [], meta: {} });
@@ -2388,9 +2621,7 @@ function App() {
   // --- Best Execution channel-aware grouping ---
   const hasBroker = bestExData?.broker?.groups?.length > 0;
   const hasLender = bestExData?.lender?.groups?.length > 0;
-  const availableChannels = [];
-  if (hasBroker) availableChannels.push('broker');
-  if (hasLender) availableChannels.push('lender');
+  const hasBestEx = bestExData?.best_ex?.groups?.length > 0;
 
   // Get the active channel's best-ex groups, filtered by product exclusions, sorted by product priority
   const activeChData = bestExData?.[activeChannel];
@@ -2957,12 +3188,14 @@ function App() {
               )}
 
               {/* === Channel Tabs === */}
-              {availableChannels.length > 0 && (
+              {hasBestEx && (
                 <div className="channel-tabs">
-                  {['broker', 'lender'].map(ch => {
+                  {[
+                    { key: 'best_ex', label: 'Best Execution', hasData: hasBestEx },
+                    { key: 'broker', label: 'Broker', hasData: hasBroker },
+                    { key: 'lender', label: 'Lender', hasData: hasLender },
+                  ].map(({ key: ch, label, hasData }) => {
                     const chData = bestExData?.[ch];
-                    const hasData = chData?.groups?.length > 0;
-                    const label = ch === 'broker' ? 'Broker' : 'Lender';
                     const investorNames = chData?.investors?.join(', ') || '';
                     const productCount = chData?.groups?.filter(g => !excludedSet.has(g.product_code)).length || 0;
                     return (
@@ -2972,7 +3205,7 @@ function App() {
                         onClick={() => hasData && setActiveChannel(ch)}
                         disabled={!hasData}
                       >
-                        {label} Best Execution
+                        {ch === 'best_ex' ? label : `${label} Best Execution`}
                         {hasData && (
                           <span className="tab-meta">
                             {chData.investorCount} investor{chData.investorCount !== 1 ? 's' : ''} · {productCount} product{productCount !== 1 ? 's' : ''}
