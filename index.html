@@ -1027,8 +1027,11 @@ function buildBestExecution(rankedResults, loanAmount, opts) {
           twoYearReturn = (-interestVsPar - costToPar) / Math.abs(costToPar);
         }
         const totalMonthlyFull = r.pricing.total_monthly_payment + monthlyEscrow;
+        // DTI eligibility: use original scenario payment (pre-optimizer) if available,
+        // so DTI filter reflects affordability at the requested loan amount
+        const dtiPayment = r._scenario_monthly_payment ?? r.pricing.total_monthly_payment;
         const dti = monthlyIncome > 0
-          ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome
+          ? (dtiPayment + monthlyEscrow + additionalDebt) / monthlyIncome
           : 0;
         const dtiEligible = monthlyIncome <= 0 || dti <= maxDTI;
 
@@ -1254,8 +1257,10 @@ function buildOverallBestExecution(channelResults, loanAmount, opts) {
         twoYearReturn = (-interestVsPar - costToPar) / Math.abs(costToPar);
       }
       const totalMonthlyFull = r.pricing.total_monthly_payment + monthlyEscrow;
+      // DTI eligibility: use original scenario payment (pre-optimizer) if available
+      const dtiPayment = r._scenario_monthly_payment ?? r.pricing.total_monthly_payment;
       const dti = monthlyIncome > 0
-        ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome
+        ? (dtiPayment + monthlyEscrow + additionalDebt) / monthlyIncome
         : 0;
       const dtiEligible = monthlyIncome <= 0 || dti <= maxDTI;
 
@@ -1479,6 +1484,11 @@ function applyRefiOptimizer(results, optimizerParams) {
   if (!optimizerParams) return;
   const eligible = results.filter(r => r.eligibility.is_eligible && r.pricing);
   for (const r of eligible) {
+    // Preserve original-scenario monthly payment BEFORE optimizer changes it.
+    // DTI eligibility must be assessed at the original requested loan amount,
+    // not the optimized one — otherwise the optimizer's DTI constraint makes
+    // every rate appear DTI-eligible by construction.
+    r._scenario_monthly_payment = r.pricing.total_monthly_payment;
     const opt = solveOptimalLoan(r, optimizerParams);
     r._optimizer = opt;
     // Update the pricing fields to reflect the optimal loan amount
@@ -1560,7 +1570,9 @@ function downloadPricingExcel(response, eligibleGroups, form) {
       const cost3yr = totalUpfront + interest3yr + mi3yr;
       // AR: Monthly Escrow
       // AS: DTI = (housing payment + escrow + additional debt service) / monthly income
-      const dti = monthlyIncome > 0 ? (r.pricing.total_monthly_payment + monthlyEscrow + additionalDebt) / monthlyIncome : 0;
+      // Use original scenario payment for DTI when optimizer is active
+      const dtiPayment = r._scenario_monthly_payment ?? r.pricing.total_monthly_payment;
+      const dti = monthlyIncome > 0 ? (dtiPayment + monthlyEscrow + additionalDebt) / monthlyIncome : 0;
 
       allRows.push({
         _product_code: r.product_code,
@@ -1635,40 +1647,51 @@ function downloadPricingExcel(response, eligibleGroups, form) {
   }
 
   for (const [code, group] of byCode) {
-    // Total cost rank within product code
-    const sorted = [...group].sort((a, b) => a['Total Cost Over TIL'] - b['Total Cost Over TIL']);
+    // Only rank DTI-eligible rows — ineligible rows get blank ranks
+    const dtiEligible = group.filter(row => row['DTI Eligible'] === 'Y');
+    const dtiIneligible = group.filter(row => row['DTI Eligible'] !== 'Y');
+    // Clear ranks on ineligible rows
+    for (const row of dtiIneligible) {
+      row['Rank (Total Cost)'] = '';
+      row['No Cost Rank'] = '';
+      row['Rank 3-Year'] = '';
+    }
+
+    // Total cost rank within product code (DTI-eligible only)
+    const sorted = [...dtiEligible].sort((a, b) => a['Total Cost Over TIL'] - b['Total Cost Over TIL']);
     sorted.forEach((row, i) => { row['Rank (Total Cost)'] = i + 1; });
 
-    // No Cost Rank (by abs(Total Upfront) — closest to $0 = rank 1)
-    const noCostSorted = [...group].sort((a, b) => Math.abs(a['Total Upfront Costs']) - Math.abs(b['Total Upfront Costs']));
+    // No Cost Rank (by abs(Total Upfront) — closest to $0 = rank 1, DTI-eligible only)
+    const noCostSorted = [...dtiEligible].sort((a, b) => Math.abs(a['Total Upfront Costs']) - Math.abs(b['Total Upfront Costs']));
     noCostSorted.forEach((row, i) => { row['No Cost Rank'] = i + 1; });
 
-    // No Cost Loan Option flag
-    for (const row of group) {
+    // No Cost Loan Option flag (DTI-eligible only)
+    for (const row of dtiEligible) {
       const absUp = Math.abs(row['Total Upfront Costs']);
       if (absUp <= Math.abs(0.0015 * row['Total Loan Amt']) && absUp < 1000) {
         row['No Cost Loan Option'] = 'No Cost Option';
       }
     }
 
-    // 3-Year rank within product code
-    const sorted3 = [...group].sort((a, b) => a['3-Year Costs'] - b['3-Year Costs']);
+    // 3-Year rank within product code (DTI-eligible only)
+    const sorted3 = [...dtiEligible].sort((a, b) => a['3-Year Costs'] - b['3-Year Costs']);
     sorted3.forEach((row, i) => { row['Rank 3-Year'] = i + 1; });
     if (sorted3.length > 0) sorted3[0]['3-Year Winner'] = '3-Year Winner';
 
   }
 
-  // --- Global flags (across ALL eligible results) for intro statement ---
+  // --- Global flags (across DTI-eligible results only) for intro statement ---
+  const dtiEligibleRows = allRows.filter(row => row['DTI Eligible'] === 'Y');
 
-  // Best overall option (lowest total cost across everything)
-  if (allRows.length > 0) {
-    const globalBest = allRows.reduce((best, row) => row['Total Cost Over TIL'] < best['Total Cost Over TIL'] ? row : best);
+  // Best overall option (lowest total cost across DTI-eligible)
+  if (dtiEligibleRows.length > 0) {
+    const globalBest = dtiEligibleRows.reduce((best, row) => row['Total Cost Over TIL'] < best['Total Cost Over TIL'] ? row : best);
     globalBest['Best of Product'] = 'Best Overall';
   }
 
-  // Global Lowest / Highest APR
-  if (allRows.length > 0) {
-    const globalAPRSorted = [...allRows].sort((a, b) => a['APR %'] - b['APR %']);
+  // Global Lowest / Highest APR (DTI-eligible only)
+  if (dtiEligibleRows.length > 0) {
+    const globalAPRSorted = [...dtiEligibleRows].sort((a, b) => a['APR %'] - b['APR %']);
     globalAPRSorted[0]['Lowest APR'] = 'Lowest APR';
     globalAPRSorted[globalAPRSorted.length - 1]['Highest APR'] = 'Highest APR';
   }
